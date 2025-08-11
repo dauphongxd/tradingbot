@@ -1,0 +1,8 @@
+path: C:\Users\dddddddddddddddd\Documents\PROJECTS CODE\trading bot\trading_dataset
+train: images/train
+val: images/val
+
+names:
+  0: entry
+  1: stoploss
+  2: target

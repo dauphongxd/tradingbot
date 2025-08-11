@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 3
+names: ['entry', 'stoploss', 'target']
+
+roboflow:
+  workspace: ryan-nguyen
+  project: price-detection-dtnqq
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/ryan-nguyen/price-detection-dtnqq/dataset/1
