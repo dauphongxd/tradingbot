@@ -1,0 +1,11 @@
+opencv-python
+ultralytics
+easyocr
+transformers
+requests
+ccxt
+python-telegram-bot
+Pillow
+telethon
+python-dotenv
+flask

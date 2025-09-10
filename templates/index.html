@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- This line makes the page automatically refresh every 10 seconds -->
+    <meta http-equiv="refresh" content="10">
+    <title>Trading Bot Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>Trading Bot Dashboard</h1>
+
+        <div class="summary-grid">
+
+            <div class="card">
+                <h2>Win Rate</h2>
+                <p>{{ stats.win_rate }}</p>
+            </div>
+            <div class="card">
+                <h2>Net P/L</h2>
+                <p class="{{ 'profit' if stats.total_pnl >= 0 else 'loss' }}">
+                    ${{ "%.2f"|format(stats.total_pnl) }}
+                </p>
+            </div>
+            <div class="card">
+                <h2>Total Trades</h2>
+                <p>{{ stats.total_trades }}</p>
+            </div>
+            <div class="card">
+                <h2>Profit Factor</h2>
+                <p>{{ stats.profit_factor }}</p>
+            </div>
+
+            <div class="card">
+                <h2>Balance</h2>
+                <p>${{ "%.2f"|format(balance) }}</p>
+            </div>
+            <div class="card">
+                <h2>Floating P/L</h2>
+                <p class="{{ 'profit' if floating_pnl >= 0 else 'loss' }}">
+                    ${{ "%.2f"|format(floating_pnl) }}
+                </p>
+            </div>
+            <div class="card">
+                <h2>Equity</h2>
+                <p>${{ "%.2f"|format(equity) }}</p>
+            </div>
+            <div class="card">
+                <h2>Leverage</h2>
+                <p>{{ leverage }}x</p>
+            </div>
+        </div>
+
+        <h2>Open Positions ({{ trades|length }})</h2>
+        <div class="table-container">
+            {% if trades %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Pair</th>
+                            <th>Direction</th>
+                            <th>Entry</th>
+                            <th>Stop Loss</th>
+                            <th>Take Profit</th>
+                            <th>Current P/L</th>
+                            <th>Current Price</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for trade in trades %}
+                        <tr>
+                            <!-- Pair -->
+                            <td>{{ trade.pair }}</td>
+
+                            <!-- Direction -->
+                            <td>
+                                <span class="{{ 'long' if trade.is_long else 'short' }}">
+                                    {{ 'LONG' if trade.is_long else 'SHORT' }}
+                                </span>
+                            </td>
+
+                            <!-- Entry -->
+                            <td>{{ trade.entry_price }}</td>
+
+                            <!-- Stop Loss -->
+                            <td>{{ trade.sl_price }}</td>
+
+                            <!-- Take Profit (Simplified) -->
+                            <td>
+                                {% if trade.tp_levels %}
+                                    <!-- Display the price of the very last TP level -->
+                                    {{ "%.2f"|format(trade.tp_levels[-1].price) }}
+                                {% else %}
+                                    N/A
+                                {% endif %}
+                            </td>
+
+                            <!-- Current P/L -->
+                            <td>
+                                {% if trade.current_pnl is number %}
+                                    <span class="{{ 'profit' if trade.current_pnl >= 0 else 'loss' }}">
+                                        ${{ "%.2f"|format(trade.current_pnl) }}
+                                    </span>
+                                {% else %}
+                                    {{ trade.current_pnl }}
+                                {% endif %}
+                            </td>
+
+                            <!-- Current Price -->
+                            <td class="current-price">
+                                {% if trade.current_price is number %}
+                                    {{ "%.2f"|format(trade.current_price) }}
+                                {% else %}
+                                    {{ trade.current_price }}
+                                {% endif %}
+                            </td>
+
+                            <!-- Actions -->
+                            <td>
+                                <a href="{{ url_for('close_trade', trade_id=trade.trade_id) }}"
+                                   class="close-button"
+                                   onclick="return confirm('Are you sure you want to manually close this {{trade.pair}} trade?');">
+                                   &times;
+                                </a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <p>No open positions.</p>
+            {% endif %}
+        </div>
+
+        <h2>Trade History</h2>
+        <div class="table-container">
+            {% if trade_history %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Pair</th>
+                            <th>Direction</th>
+                            <th>Entry</th>
+                            <th>Exit</th>
+                            <th>Status</th>
+                            <th>P/L</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for closed_trade in trade_history %}
+                        <tr>
+                            <td>{{ closed_trade.pair }}</td>
+                            <td>
+                                <span class="{{ 'long' if closed_trade.direction == 'LONG' else 'short' }}">
+                                    {{ closed_trade.direction }}
+                                </span>
+                            </td>
+                            <td>{{ "%.2f"|format(closed_trade.entry_price) }}</td>
+                            <td>{{ "%.2f"|format(closed_trade.exit_price) }}</td>
+                            <td>{{ closed_trade.status }}</td>
+                            <td>
+                                <span class="{{ 'profit' if closed_trade.pnl >= 0 else 'loss' }}">
+                                    ${{ "%.2f"|format(closed_trade.pnl) }}
+                                </span>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <p>No closed trades yet.</p>
+            {% endif %}
+        </div>
+
+        <p class="footer">Page automatically refreshes every 10 seconds.</p>
+    </div>
+</body>
+</html>

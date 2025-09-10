@@ -2,3 +2,4 @@
 images/
 labels/
 "price detection.v1i.yolov8/"
+.env
