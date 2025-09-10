@@ -384,6 +384,7 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
     """Downloads an image from a file_id, extracts prices, and opens a trade."""
     try:
         # 1. Get the image file and analyze it
+        load_state()
         photo_file = await context.bot.get_file(photo_file_id)
         image_path = f"{photo_file.file_id}.jpg"
         await photo_file.download_to_drive(image_path)
@@ -492,24 +493,31 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # Silently ignore if no hashtag
 
     pair_tag = match.group(1).upper()
-    trading_pair = f"{pair_tag}/USDT"
+    trading_pair = f"{pair_tag}USDT"
 
     try:
-        await exchange.load_markets()
+        # 1. Force a reload of the markets to ensure we have the latest data.
+        await exchange.load_markets(True)
 
-        # Get a list of all active futures market symbols from Bybit
-        futures_markets = [
-            m['symbol'] for m in exchange.markets.values()
-            if m.get('type') == 'swap' and m.get('active')
-        ]
+        # 2. Use the canonical ccxt method to check for the symbol.
+        # This will raise a specific `ccxt.BadSymbol` error if it's not found.
+        market = exchange.market(trading_pair)
 
-        if trading_pair not in futures_markets:
-            logger.error(f"Signal ignored. Pair '{trading_pair}' is not a valid FUTURES symbol on Bybit.")
-            return  # Stop processing this signal
+        # 3. As an extra safeguard, ensure it's a futures/swap contract.
+        # The `market` object has a `swap` flag which should be True.
+        if not market.get('swap'):
+            logger.error(f"Signal ignored. Pair '{trading_pair}' exists but is not a SWAP/FUTURES contract.")
+            return
 
+    except ccxt.BadSymbol:
+        # This is the expected error when a symbol doesn't exist.
+        logger.error(f"Signal ignored. Pair '{trading_pair}' is not a valid FUTURES symbol on Binance.")
+        return  # Stop processing this signal
     except Exception as e:
+        # This catches other errors like network issues during validation.
+        logger.error(f"Error validating pair with exchange: {e}", exc_info=True)
         await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                       text=f"Error validating pair with exchange: {e}")
+                                       text=f"An error occurred while validating the trading pair: {e}")
         return
 
     # --- The "Cleanliness" Check ---

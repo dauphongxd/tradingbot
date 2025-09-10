@@ -20,7 +20,15 @@ exchange = ccxt.binanceusdm()
 def calculate_stats(trade_history):
     """Calculates performance metrics from a list of closed trades."""
     if not trade_history:
-        return {"total_trades": 0}  # Return default if no history
+        # Return a full dictionary with default "zero" values
+        return {
+            "total_trades": 0,
+            "win_rate": "0.00%",
+            "total_pnl": 0.0,
+            "profit_factor": "0.00",
+            "avg_win": 0.0,
+            "avg_loss": 0.0
+        }  # Return default if no history
 
     total_trades = len(trade_history)
     wins = [t for t in trade_history if t['pnl'] > 0]
