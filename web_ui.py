@@ -3,6 +3,10 @@ import os
 from flask import Flask, render_template, redirect, url_for
 import ccxt
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # --- Configuration ---
 DATA_FILE = "trading_data.json"
 INITIAL_BALANCE = 1000.00  # Should match your bot's config
@@ -11,10 +15,6 @@ INITIAL_BALANCE = 1000.00  # Should match your bot's config
 app = Flask(__name__)
 # Use a synchronous version of ccxt for this simple UI
 exchange = ccxt.binanceusdm()
-exchange.proxies = {
-    'http': 'http://189.219.53.209:10000',
-    'https': 'http://189.219.53.209:10000',
-}
 
 
 def calculate_stats(trade_history):
@@ -138,8 +138,8 @@ def close_trade(trade_id):
 
         # --- Send a notification to the bot's user ---
         # This is an optional but nice feature
-        bot_token = "8304193867:AAFtge5snCmFKmElWLcRn4PUs5XRpNWt974"  # You need to put your token here
-        user_id = 354055384  # And your ID here
+        bot_token = os.getenv('TELEGRAM_BOT_TOKEN')  # You need to put your token here
+        user_id = os.getenv('AUTHORIZED_USER_ID')  # And your ID here
         message = (
             f"🔵🔵🔵 MANUAL CLOSE 🔵🔵🔵\n\n"
             f"Trade Closed: **{trade_to_close['pair']}**\n"

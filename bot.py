@@ -72,7 +72,6 @@ app_state = {
 }
 # Use a single, shared exchange instance for efficiency
 exchange = ccxt.binanceusdm()
-exchange.aiohttp_proxy = 'http://189.219.53.209:10000'
 
 
 # ==============================================================================
