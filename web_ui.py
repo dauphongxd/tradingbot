@@ -2,6 +2,7 @@ import json
 import os
 from flask import Flask, render_template, redirect, url_for
 import ccxt
+import time
 
 from dotenv import load_dotenv
 
@@ -16,6 +17,24 @@ app = Flask(__name__)
 # Use a synchronous version of ccxt for this simple UI
 exchange = ccxt.binanceusdm()
 
+
+def safe_sync_exchange_call(func, *args, **kwargs):
+    """A synchronous wrapper to safely call a ccxt function with retries."""
+    max_retries = 3
+    retry_delay_seconds = 3
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:
+            print(f"[Web UI] Exchange call failed (Attempt {attempt + 1}/{max_retries}): {e}. Retrying...")
+            if attempt + 1 == max_retries:
+                print(f"[Web UI] All {max_retries} attempts failed. Giving up.")
+                return None
+            time.sleep(retry_delay_seconds)
+        except Exception as e:
+            print(f"[Web UI] An unexpected error occurred: {e}")
+            return None
+    return None
 
 def calculate_stats(trade_history):
     """Calculates performance metrics from a list of closed trades."""
@@ -90,9 +109,13 @@ def dashboard():
     for trade_id, trade in open_trades_data.items():
         try:
             # --- NEW: Fetch ticker for each trade individually ---
-            ticker = exchange.fetch_ticker(trade['pair'])
-            current_price = ticker['last']
+            ticker = safe_sync_exchange_call(exchange.fetch_ticker, trade['pair'])
 
+            # If the ticker is None after retries, we show N/A
+            if not ticker:
+                raise ccxt.NetworkError("Failed to fetch price after retries.")
+
+            current_price = ticker['last']
             pnl = calculate_pnl(trade, current_price)
 
             trade['current_pnl'] = pnl
@@ -130,7 +153,16 @@ def close_trade(trade_id):
         return "Trade ID not found.", 404
     trade_to_close = open_trades[trade_id]
     try:
-        ticker = exchange.fetch_ticker(trade_to_close['pair'])
+        ticker = safe_sync_exchange_call(exchange.fetch_ticker, trade_to_close['pair'])
+
+        # If we failed to get a price, we can't close the trade.
+        if not ticker:
+            print(f"CRITICAL: Failed to close trade {trade_id} via UI. Could not fetch price.")
+            # We just redirect, the user will see the trade is still open.
+            # In a more advanced UI, you would flash an error message.
+            return redirect(url_for('dashboard'))
+        # --- END NEW ---
+
         exit_price = ticker['last']
         price_diff = exit_price - trade_to_close['entry_price']
         if not trade_to_close['is_long']:

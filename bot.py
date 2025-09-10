@@ -31,6 +31,7 @@ POLL_INTERVAL_SECONDS = 3  # Check prices more frequently
 BUY_WORDS = {'buy', 'long', 'bullish', 'buying', 'bought', 'longed'}
 SELL_WORDS = {'sell', 'short', 'bearish', 'selling', 'sold', 'shorted'}
 CLOSE_WORDS = {'close', 'closing', 'closed'} # <-- ADD THIS
+BLACKLISTED_COINS = {'ETH', 'BTC'}
 
 # We only care about words that open a trade for this logic
 ALL_KEYWORDS = BUY_WORDS.union(SELL_WORDS)
@@ -68,7 +69,8 @@ app_state = {
     "balance": INITIAL_BALANCE,
     "leverage": 20.0,
     "open_trades": {},  # We will store PaperTrade objects here
-    "trade_history": []
+    "trade_history": [],
+    "pending_confirmations": {}
 }
 # Use a single, shared exchange instance for efficiency
 exchange = ccxt.binanceusdm()
@@ -80,18 +82,17 @@ exchange = ccxt.binanceusdm()
 def save_state():
     """Saves the full current state (balance, leverage, and open trades) to the data file."""
     with open(DATA_FILE, 'w') as f:
-        # Convert the open_trades objects to a dictionary format that can be saved as JSON
         trades_to_save = {trade_id: asdict(trade) for trade_id, trade in app_state["open_trades"].items()}
 
         state_to_save = {
             "balance": app_state["balance"],
             "leverage": app_state["leverage"],
             "open_trades": trades_to_save,
-            "trade_history": app_state["trade_history"]
+            "trade_history": app_state["trade_history"],
+            # --- NEW LINE ---
+            "pending_confirmations": app_state.get("pending_confirmations", {})
         }
         json.dump(state_to_save, f, indent=4)
-    # No need to log every save, it can be noisy. Can be re-enabled if needed.
-    # logger.info("State saved.")
 
 
 def load_state():
@@ -113,12 +114,45 @@ def load_state():
 
                 app_state["trade_history"] = data.get("trade_history", [])
 
+                app_state["pending_confirmations"] = data.get("pending_confirmations", {})
+
                 trade_count = len(app_state["open_trades"])
-                logger.info(f"State loaded. Balance: ${app_state['balance']:.2f}, Open Trades: {trade_count}")
+                pending_count = len(app_state["pending_confirmations"])
+                logger.info(
+                    f"State loaded. Balance: ${app_state['balance']:.2f}, "
+                    f"Open Trades: {trade_count}, Pending Confirmations: {pending_count}"
+                )
             except (json.JSONDecodeError, TypeError) as e:
                 logger.error(
                     f"Could not load state from {DATA_FILE}. It might be corrupted. Starting fresh. Error: {e}")
 
+
+async def safe_exchange_call(func, *args, **kwargs):
+    """
+    A wrapper to safely call a ccxt function with a retry mechanism.
+    Handles common network errors and exchange downtime.
+    """
+    max_retries = 3
+    retry_delay_seconds = 5  # Wait 5 seconds between retries
+
+    for attempt in range(max_retries):
+        try:
+            # Await the function call with its arguments
+            return await func(*args, **kwargs)
+        except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:
+            logger.warning(
+                f"[Exchange Call Failed] Attempt {attempt + 1}/{max_retries}. "
+                f"Error: {e}. Retrying in {retry_delay_seconds}s..."
+            )
+            if attempt + 1 == max_retries:
+                logger.critical(f"All {max_retries} attempts to contact the exchange failed. Giving up.")
+                return None  # Return None if all retries fail
+            await asyncio.sleep(retry_delay_seconds)
+        except Exception as e:
+            logger.error(f"[Exchange Call] An unexpected and non-retriable error occurred: {e}", exc_info=True)
+            return None # Do not retry on unknown errors
+
+    return None
 
 # ==============================================================================
 #  The Async Market Monitor
@@ -149,13 +183,18 @@ async def market_monitor(application: Application):
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            try:
-                tickers = await exchange.fetch_tickers(pairs_to_watch)
-            except ccxt.BadSymbol as e:
-                logger.error(f"[Monitor] A bad symbol was found in open_trades, skipping this cycle. Error: {e}")
-                # Wait a longer time before retrying to avoid spamming errors
-                await asyncio.sleep(15)
-                continue  # Skip to the next loop iteration
+            tickers = await safe_exchange_call(exchange.fetch_tickers, pairs_to_watch)
+
+            # If tickers is None, it means all retries failed.
+            if not tickers:
+                logger.critical("[Monitor] Could not fetch market data from exchange. It may be down. Pausing for 60s.")
+                # Optional: Send an alert to the user that the monitor is struggling
+                await application.bot.send_message(
+                    chat_id=AUTHORIZED_USER_ID,
+                    text="🚨 **CRITICAL: Market Monitor** 🚨\n\nCould not connect to Binance to check SL/TP for open trades. The exchange may be down for maintenance. Will keep retrying."
+                )
+                await asyncio.sleep(60)  # Wait a longer time before the next full loop
+                continue  # Skip the rest of this loop iteration
 
 
             for trade in open_trades:
@@ -324,17 +363,32 @@ async def close_trade_by_symbol(symbol: str, application: Application):
         )
         return
 
-    # Close the trade using existing logic
+    # --- START OF CORRECTED LOGIC ---
     try:
-        ticker = await exchange.fetch_ticker(trade_to_close.pair)
+        # Step 1: Safely fetch the ticker with retries
+        ticker = await safe_exchange_call(exchange.fetch_ticker, trade_to_close.pair)
+
+        # Step 2: Handle the failure case
+        if not ticker:
+            logger.error(f"Failed to close trade for {symbol}: Could not fetch price from exchange.")
+            await application.bot.send_message(
+                chat_id=AUTHORIZED_USER_ID,
+                text=f"🚨 **CLOSE FAILED for {symbol}** 🚨\n\nCould not get the current price from Binance after multiple retries. The trade remains open. Please check manually.",
+                parse_mode='Markdown'
+            )
+            return
+
+        # Step 3: THIS WAS THE MISSING PART - Use the successful result to close the trade
         exit_price = ticker['last']
         await process_trade_closure(application, trade_to_close, "MANUAL_CLOSE", exit_price)
         logger.info(f"Closed trade for {symbol} via channel command.")
+
     except Exception as e:
-        logger.error(f"Error closing trade for {symbol}: {e}")
+        # Generic catch-all for any other unexpected errors
+        logger.error(f"An unexpected error occurred while closing trade for {symbol}: {e}")
         await application.bot.send_message(
             chat_id=AUTHORIZED_USER_ID,
-            text=f"🚨 Failed to close trade for **{symbol}**. Error: {e}",
+            text=f"🚨 An unexpected error occurred trying to close **{symbol}**. Error: {e}",
             parse_mode='Markdown'
         )
 
@@ -493,6 +547,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # Silently ignore if no hashtag
 
     pair_tag = match.group(1).upper()
+
+    if pair_tag in BLACKLISTED_COINS:
+        logger.warning(f"Signal for #{pair_tag} ignored because it is on the blacklist.")
+        return
+
     trading_pair = f"{pair_tag}USDT"
 
     try:
@@ -533,45 +592,79 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Clean signal detected. Executing trade automatically.")
         await execute_trade(update, context, trading_pair, photo_file_id)
     else:
-        logger.info("Complex signal detected. Asking for user confirmation.")
+        # --- THIS IS THE ENTIRE REPLACEMENT 'else' BLOCK ---
+        logger.info("Complex signal detected. Creating persistent confirmation request.")
 
-        callback_data = f"confirm_trade|{trading_pair}|{photo_file_id}"
+        # 1. Generate a unique ID for this request
+        request_id = str(uuid4())
+
+        # 2. Forward the original message to provide context
+        fwd_message = await message.forward(chat_id=int(AUTHORIZED_USER_ID))
+
+        # 3. Create the keyboard with the NEW callback_data format
         keyboard = [[
-            InlineKeyboardButton("✅ Confirm Trade", callback_data=callback_data),
-            InlineKeyboardButton("❌ Ignore", callback_data="ignore"),
+            InlineKeyboardButton("✅ Confirm Trade", callback_data=f"confirm_trade|{request_id}"),
+            InlineKeyboardButton("❌ Ignore", callback_data=f"ignore_trade|{request_id}"),
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # Forward the original message to yourself to provide context
-        fwd_message = await message.forward(chat_id=int(AUTHORIZED_USER_ID))
-
-        # Send the confirmation buttons as a reply to the forwarded message
-        await context.bot.send_message(
+        # 4. Send the confirmation buttons as a reply
+        confirmation_message = await context.bot.send_message(
             chat_id=int(AUTHORIZED_USER_ID),
             text="This signal contains extra text. Please confirm to proceed:",
             reply_markup=reply_markup,
             reply_to_message_id=fwd_message.message_id
         )
 
+        # 5. Create the data packet to save
+        pending_request = {
+            "trading_pair": trading_pair,
+            "photo_file_id": photo_file_id,
+            "confirmation_message_id": confirmation_message.message_id
+        }
+
+        # 6. Save it to the state and immediately to the file
+        app_state["pending_confirmations"][request_id] = pending_request
+        save_state()
+        logger.info(f"Saved pending confirmation with ID: {request_id}")
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles all confirmation button presses."""
+    """Handles all confirmation button presses using persistent state."""
     query = update.callback_query
     await query.answer()
-    callback_data = query.data
 
-    if callback_data == "ignore":
-        await query.edit_message_text(text="Signal ignored.")
-        return
+    # --- CRITICAL: Reload state to ensure we have the latest info after a restart ---
+    load_state()
 
-    elif callback_data.startswith("confirm_trade"):
-        await query.edit_message_text(text="✅ Opening trade...")
-        _, trading_pair, photo_file_id = callback_data.split('|')
-        await execute_trade(update, context, trading_pair, photo_file_id)
+    try:
+        action, request_id = query.data.split('|')
+        pending_requests = app_state.get("pending_confirmations", {})
 
-    elif callback_data.startswith("confirm_close"):
-        await query.edit_message_text(text="✅ Closing trade...")
-        _, symbol = callback_data.split('|')
-        await close_trade_by_symbol(symbol, context.application)
+        if request_id not in pending_requests:
+            await query.edit_message_text(text="⚠️ This trade confirmation has expired or was already processed.")
+            return
+
+        # Retrieve the details from our saved state
+        request_data = pending_requests[request_id]
+        trading_pair = request_data["trading_pair"]
+        photo_file_id = request_data["photo_file_id"]
+
+        if action == "confirm_trade":
+            await query.edit_message_text(text=f"✅ Confirmation received. Opening trade for {trading_pair}...")
+            # The core action is the same
+            await execute_trade(update, context, trading_pair, photo_file_id)
+
+        elif action == "ignore_trade":
+            await query.edit_message_text(text="❌ Signal ignored.")
+
+    finally:
+        # --- CLEANUP: No matter what, remove the request from the state ---
+        # This prevents dangling or double-processed requests.
+        action, request_id = query.data.split('|') # Re-split to ensure we have the ID
+        if request_id in app_state.get("pending_confirmations", {}):
+            del app_state["pending_confirmations"][request_id]
+            save_state()
+            logger.info(f"Processed and removed pending confirmation ID: {request_id}")
 
 
 
