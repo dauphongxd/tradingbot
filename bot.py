@@ -14,6 +14,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from extract_price import extract_prices_from_image
+from telegram.request import Request
+import database as db
 
 from dotenv import load_dotenv
 
@@ -23,8 +25,6 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER_ID = os.getenv('AUTHORIZED_USER_ID')
 INITIAL_BALANCE = 1000.00
-RISK_PER_TRADE = 50.00  # This is the dollar amount to risk, not the position size
-DATA_FILE = "trading_data.json"
 POLL_INTERVAL_SECONDS = 3  # Check prices more frequently
 
 # --- Define keywords for the smart filter ---
@@ -66,65 +66,12 @@ class PaperTrade:
 #  Global State & Exchange Instance
 # ==============================================================================
 app_state = {
-    "balance": INITIAL_BALANCE,
-    "leverage": 20.0,
-    "open_trades": {},  # We will store PaperTrade objects here
-    "trade_history": [],
-    "pending_confirmations": {}
+    "balance": 0.0,
+    "leverage": 0.0,
+    "pending_confirmations": {} # This is still useful in-memory
 }
 # Use a single, shared exchange instance for efficiency
 exchange = ccxt.binanceusdm()
-
-
-# ==============================================================================
-#  State Management (No changes needed here)
-# ==============================================================================
-def save_state():
-    """Saves the full current state (balance, leverage, and open trades) to the data file."""
-    with open(DATA_FILE, 'w') as f:
-        trades_to_save = {trade_id: asdict(trade) for trade_id, trade in app_state["open_trades"].items()}
-
-        state_to_save = {
-            "balance": app_state["balance"],
-            "leverage": app_state["leverage"],
-            "open_trades": trades_to_save,
-            "trade_history": app_state["trade_history"],
-            # --- NEW LINE ---
-            "pending_confirmations": app_state.get("pending_confirmations", {})
-        }
-        json.dump(state_to_save, f, indent=4)
-
-
-def load_state():
-    """Loads the full state from the data file if it exists."""
-    global app_state
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f:
-            try:
-                data = json.load(f)
-                app_state["balance"] = data.get("balance", INITIAL_BALANCE)
-                app_state["leverage"] = data.get("leverage", 20.0)
-
-                # Recreate the PaperTrade objects from the loaded data
-                loaded_trades = data.get("open_trades", {})
-                app_state["open_trades"] = {
-                    trade_id: PaperTrade(**trade_data)
-                    for trade_id, trade_data in loaded_trades.items()
-                }
-
-                app_state["trade_history"] = data.get("trade_history", [])
-
-                app_state["pending_confirmations"] = data.get("pending_confirmations", {})
-
-                trade_count = len(app_state["open_trades"])
-                pending_count = len(app_state["pending_confirmations"])
-                logger.info(
-                    f"State loaded. Balance: ${app_state['balance']:.2f}, "
-                    f"Open Trades: {trade_count}, Pending Confirmations: {pending_count}"
-                )
-            except (json.JSONDecodeError, TypeError) as e:
-                logger.error(
-                    f"Could not load state from {DATA_FILE}. It might be corrupted. Starting fresh. Error: {e}")
 
 
 async def safe_exchange_call(func, *args, **kwargs):
@@ -163,18 +110,7 @@ async def market_monitor(application: Application):
     logger.info("Market monitor started.")
     while True:
         try:
-            if os.path.exists(DATA_FILE):
-                with open(DATA_FILE, 'r') as f:
-                    try:
-                        data = json.load(f)
-                        loaded_trades = data.get("open_trades", {})
-                        app_state["open_trades"] = {
-                            trade_id: PaperTrade(**trade_data)
-                            for trade_id, trade_data in loaded_trades.items()
-                        }
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning(f"Could not parse {DATA_FILE}, state may be out of sync.")
-            open_trades = list(app_state["open_trades"].values())
+            open_trades = db.get_open_trades()
             if not open_trades:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
@@ -203,50 +139,60 @@ async def market_monitor(application: Application):
                 exit_price = None
                 status = None
 
-                # --- 1. Check for PARTIAL TAKE PROFIT hits ---
+                # --- 1. Check for STOP LOSS hit ---
+                # The trade might have been fully closed by the last TP, so we check if it still exists
+                if (trade.is_long and current_price <= trade.sl_price) or \
+                        (not trade.is_long and current_price >= trade.sl_price):
+                    await process_trade_closure(application, trade, "SL_HIT", trade.sl_price)
+                    continue  # Move to the next trade, as this one is now closed
+
+                # --- 2. Check for PARTIAL TAKE PROFIT hits ---
                 if trade.tp_levels:
                     for i, level in enumerate(trade.tp_levels):
                         if level['status'] == 'pending':
-                            # Check if the next pending TP level is hit
                             if (trade.is_long and current_price >= level['price']) or \
-                               (not trade.is_long and current_price <= level['price']):
+                                    (not trade.is_long and current_price <= level['price']):
+
+                                # First, process the partial closure as always
                                 await process_partial_tp_closure(application, trade, level, i)
-                            break # IMPORTANT: Only check the very next pending level in each loop
 
-                if not trade.sl_moved_to_be and trade.tp_levels:
-                    # Check if the 5th TP level (index 4) has been hit
-                    # We also check length to prevent an IndexError
-                    if len(trade.tp_levels) > 4 and trade.tp_levels[4]['status'] == 'hit':
-                        original_sl = trade.sl_price
-                        # Move SL to the entry price
-                        trade.sl_price = trade.entry_price
-                        # Set the flag to True so this doesn't run again for this trade
-                        trade.sl_moved_to_be = True
+                                # --- NEW HYBRID STOP-LOSS LOGIC ---
+                                new_sl_price = None
+                                notification_reason = ""
 
-                        # Save the state immediately to make the new SL persistent
-                        save_state()
+                                # The TRIGGER: If TP2 (index 1) is hit, move SL to Break-Even
+                                if i == 1 and not trade.sl_moved_to_be:
+                                    new_sl_price = trade.entry_price
+                                    trade.sl_moved_to_be = True  # Set the flag so this only runs once
+                                    notification_reason = "TP2 hit. Trade is now risk-free."
 
-                        # Send a notification to the user
-                        message = (
-                            f"✅ **Stop-Loss Updated for {trade.pair}** ✅\n\n"
-                            f"TP5 was hit. The trade is now risk-free.\n\n"
-                            f"Original SL: `{original_sl}`\n"
-                            f"**New SL: `{trade.sl_price}`** (Break-Even)"
-                        )
-                        await application.bot.send_message(
-                            chat_id=AUTHORIZED_USER_ID, text=message, parse_mode='Markdown'
-                        )
-                        logger.info(f"Moved SL for trade {trade.trade_id} to break-even at {trade.sl_price}.")
+                                # The TRAIL: If TP3 or higher is hit, trail the SL to the TP level from two steps ago
+                                elif i > 1:
+                                    # e.g., When TP3 (i=2) is hit, move SL to TP1 (i-2=0)
+                                    # e.g., When TP4 (i=3) is hit, move SL to TP2 (i-2=1)
+                                    new_sl_price = trade.tp_levels[i - 2]['price']
+                                    notification_reason = f"TP{i + 1} hit. Trailing stop-loss updated."
 
-                # --- 2. Check for STOP LOSS hit ---
-                # The trade might have been fully closed by the last TP, so we check if it still exists
-                if trade.trade_id in app_state["open_trades"]:
-                    if (trade.is_long and current_price <= trade.sl_price) or \
-                       (not trade.is_long and current_price >= trade.sl_price):
-                        status = "SL_HIT"
-                        exit_price = trade.sl_price
-                    if status:
-                        await process_trade_closure(application, trade, status, exit_price)
+                                # If we determined a new SL is needed, update and notify
+                                if new_sl_price and new_sl_price != trade.sl_price:
+                                    original_sl = trade.sl_price
+                                    trade.sl_price = new_sl_price
+                                    db.update_trade(trade)
+
+                                    message = (
+                                        f"✅ **Stop-Loss Updated for {trade.pair}** ✅\n\n"
+                                        f"{notification_reason}\n\n"
+                                        f"Original SL: `{original_sl}`\n"
+                                        f"**New SL: `{trade.sl_price}`**"
+                                    )
+                                    await application.bot.send_message(
+                                        chat_id=AUTHORIZED_USER_ID, text=message, parse_mode='Markdown'
+                                    )
+                                    logger.info(
+                                        f"Moved SL for trade {trade.trade_id} to {trade.sl_price}. Reason: {notification_reason}")
+
+                            break  # Only check the next pending level in each loop
+
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
         except ccxt.NetworkError as e:
             logger.error(f"[Monitor] Network error: {e}. Retrying in 30s.")
@@ -271,26 +217,26 @@ async def process_partial_tp_closure(application: Application, trade: PaperTrade
     pnl = price_diff * size_to_close
 
     # Update state
-    app_state["balance"] += pnl
+    current_balance = float(db.get_setting("balance"))
+    new_balance = current_balance + pnl
+    db.update_setting("balance", new_balance)
     trade.remaining_size -= size_to_close
-    level['status'] = 'hit'  # Mark this level as completed
+    level['status'] = 'hit'
 
-    # If this was the last TP, the trade is fully closed
-    is_fully_closed = (level_index == 9)  # 9 because index is 0-based
-    if is_fully_closed or trade.remaining_size < 1e-8:  # Use a small threshold for float comparison
-        if trade.trade_id in app_state["open_trades"]:
-            del app_state["open_trades"][trade.trade_id]
-
-    save_state()
+    is_fully_closed = (level_index == 9) or trade.remaining_size < 1e-8
+    if is_fully_closed:
+        db.close_trade(trade.trade_id, f"TP{level_index + 1}_FULL_CLOSE", level['price'], pnl)
+    else:
+        db.update_trade(trade)
 
     # Prepare notification message
     result_text = f"🎯🎯🎯 PARTIAL TAKE PROFIT {level_index + 1}/10 🎯🎯🎯\n\n"
     message = (
         f"{result_text}"
         f"Trade: **{trade.pair}**\n"
-        f"Closed **10%** of position at `{exit_price}`\n"
+        f"Closed **10%** of position at `{level['price']}`\n"
         f"Portion PNL: `${pnl:,.2f}`\n\n"
-        f"**New Balance: `${app_state['balance']:,.2f}`**\n"
+        f"**New Balance: `${new_balance:,.2f}`**\n"
         f"Remaining Size: `{trade.remaining_size:.4f}`"
     )
 
@@ -310,24 +256,11 @@ async def process_trade_closure(application: Application, trade: PaperTrade, sta
         price_diff = -price_diff
 
     pnl = price_diff * trade.remaining_size
-    app_state["balance"] += pnl
+    current_balance = float(db.get_setting("balance"))
+    new_balance = current_balance + pnl
+    db.update_setting("balance", new_balance)
 
-    # --- NEW: Create a history record before deleting the trade ---
-    history_record = {
-        "pair": trade.pair,
-        "pnl": pnl,
-        "direction": "LONG" if trade.is_long else "SHORT",
-        "entry_price": trade.entry_price,
-        "exit_price": exit_price,
-        "status": status  # e.g., "SL_HIT", "MANUAL_CLOSE"
-    }
-    app_state["trade_history"].append(history_record)
-    # --- END NEW ---
-
-    if trade.trade_id in app_state["open_trades"]:
-        del app_state["open_trades"][trade.trade_id]
-
-    save_state()  # This now saves the history too
+    db.close_trade(trade.trade_id, status, exit_price, pnl)
 
     result_text = "❌ STOP LOSS ❌\n\n" if "SL_HIT" in status else "🔵 MANUAL CLOSE 🔵\n\n"
     message = (
@@ -335,7 +268,7 @@ async def process_trade_closure(application: Application, trade: PaperTrade, sta
         f"Trade Closed: **{trade.pair}**\n"
         f"Exit: `{exit_price}`\n"
         f"PNL: `${pnl:,.2f}`\n\n"
-        f"**New Balance: `${app_state['balance']:,.2f}`**"
+        f"**New Balance: `${new_balance:,.2f}`**"
     )
     await application.bot.send_message(
         chat_id=int(AUTHORIZED_USER_ID), text=message, parse_mode='Markdown'
@@ -346,13 +279,12 @@ async def process_trade_closure(application: Application, trade: PaperTrade, sta
 async def close_trade_by_symbol(symbol: str, application: Application):
     """Finds an open trade by its symbol and closes it at market price."""
     trade_to_close = None
-    trade_id_to_close = None
 
     # Find the trade in our app_state
-    for trade_id, trade in app_state["open_trades"].items():
+    open_trades = db.get_open_trades()
+    for trade in open_trades:
         if trade.pair.startswith(symbol + '/'):
             trade_to_close = trade
-            trade_id_to_close = trade_id
             break
 
     if not trade_to_close:
@@ -392,6 +324,71 @@ async def close_trade_by_symbol(symbol: str, application: Application):
             parse_mode='Markdown'
         )
 
+async def set_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /setleverage command to dynamically update leverage."""
+    if update.message.from_user.id != int(AUTHORIZED_USER_ID):
+        return  # Ignore commands from unauthorized users
+
+    try:
+        # Get the new leverage value from the command arguments
+        new_leverage = float(context.args[0])
+        if new_leverage < 1 or new_leverage > 125:
+            await update.message.reply_text("⚠️ **Invalid Value:** Leverage must be between 1 and 125.")
+            return
+
+        # Update the setting in the database
+        db.update_setting("leverage", new_leverage)
+
+        # IMPORTANT: Update the in-memory state as well
+        app_state["leverage"] = new_leverage
+
+        logger.info(f"Leverage updated to {new_leverage}x by user command.")
+        await update.message.reply_text(
+            f"✅ **Leverage Updated** ✅\n\n"
+            f"New leverage is now set to **{new_leverage}x** for all future trades.",
+            parse_mode='Markdown'
+        )
+
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: `/setleverage <value>` (e.g., `/setleverage 20`)", parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error in set_leverage_command: {e}", exc_info=True)
+        await update.message.reply_text(f"An error occurred: {e}")
+
+
+async def set_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /setrisk command to dynamically update RISK_PER_TRADE."""
+    if update.message.from_user.id != int(AUTHORIZED_USER_ID):
+        return
+
+    try:
+        # Get the new risk value from the command arguments
+        new_risk = float(context.args[0])
+        current_balance = float(db.get_setting("balance"))
+
+        if new_risk <= 0:
+            await update.message.reply_text("⚠️ **Invalid Value:** Risk must be a positive number.")
+            return
+        if new_risk > current_balance:
+            await update.message.reply_text(f"⚠️ **Warning:** New risk `${new_risk:,.2f}` is higher than your current balance of `${current_balance:,.2f}`.")
+
+        # This is the key: we need a way to store and retrieve this value.
+        # Let's use our database for this.
+        db.update_setting("risk_per_trade", new_risk)
+
+        logger.info(f"Risk per trade updated to ${new_risk:,.2f} by user command.")
+        await update.message.reply_text(
+            f"✅ **Risk Updated** ✅\n\n"
+            f"New risk per trade is now **${new_risk:,.2f}**.",
+            parse_mode='Markdown'
+        )
+
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: `/setrisk <dollar_amount>` (e.g., `/setrisk 50`)", parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error in set_risk_command: {e}", exc_info=True)
+        await update.message.reply_text(f"An error occurred: {e}")
+
 
 async def close_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /close_by_symbol command."""
@@ -419,7 +416,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    open_trades = app_state['open_trades'].values()
+    open_trades = db.get_open_trades()
     if not open_trades:
         await update.message.reply_text("No open positions.")
         return
@@ -427,9 +424,10 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "**Open Positions:**\n\n"
     for trade in open_trades:
         direction = "LONG" if trade.is_long else "SHORT"
+        final_tp = trade.tp_levels[-1]['price'] if trade.tp_levels else "N/A"
         message += f"- **{trade.pair}** ({direction})\n"
-        message += f"  Entry: `{trade.entry_price}`, SL: `{trade.sl_price}`, TP: `{trade.tp_price}`\n"
-        message += f"  Size: `{trade.position_size:.4f}`\n\n"
+        message += f"  Entry: `{trade.entry_price}`, SL: `{trade.sl_price}`, Final TP: `{final_tp}`\n"
+        message += f"  Initial Size: `{trade.initial_size:.4f}`, Remaining: `{trade.remaining_size:.4f}`\n\n"
 
     await update.message.reply_text(message, parse_mode='Markdown')
 
@@ -438,7 +436,7 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
     """Downloads an image from a file_id, extracts prices, and opens a trade."""
     try:
         # 1. Get the image file and analyze it
-        load_state()
+
         photo_file = await context.bot.get_file(photo_file_id)
         image_path = f"{photo_file.file_id}.jpg"
         await photo_file.download_to_drive(image_path)
@@ -450,12 +448,24 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
         # 2. Validate the extracted data
         if not all(k in extracted for k in ['entry', 'stoploss']):
             await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                           text=f"Analysis failed. Missing 'entry' or 'stoploss'. Data: `{extracted}`")
+                                           text=f"❌ **Analysis Failed:** Missing 'entry' or 'stoploss'. OCR could not read the image clearly. Data: `{extracted}`")
             return
 
         entry = extracted['entry']
         sl = extracted['stoploss']
-        tp = extracted.get('target', None)
+        is_long = sl < entry # Determine direction based on prices
+
+        if (is_long and entry <= sl) or (not is_long and entry >= sl):
+            await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
+                                           text=f"❌ **Logic Error:** Stop-Loss (`{sl}`) must be below entry (`{entry}`) for a LONG, or above for a SHORT.")
+            return
+
+        if 'target' in extracted:
+            tp = extracted['target']
+            if (is_long and tp <= entry) or (not is_long and tp >= entry):
+                await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
+                                               text=f"⚠️ **Warning:** Target price (`{tp}`) is on the wrong side of entry. Ignoring target.")
+                tp = None  # Invalidate the target
 
         if entry == sl:
             await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
@@ -463,12 +473,23 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
             return
 
         # 3. Calculate position size and create the trade object
-        leverage = app_state['leverage']
-        balance = app_state['balance']
-        if RISK_PER_TRADE > balance:
+        leverage = float(db.get_setting('leverage'))
+        balance = float(db.get_setting('balance'))
+
+        # --- START OF MODIFICATION ---
+        # Fetch the risk amount dynamically from the database
+        risk_per_trade = float(db.get_setting('risk_per_trade'))
+        if risk_per_trade is None:
+            # Fallback in case it's not set yet in the DB
             await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                           text=f"Insufficient balance. Risk: ${RISK_PER_TRADE:.2f}, Available: ${balance:.2f}")
+                                               text="⚠️ **CRITICAL:** Risk per trade is not set. Please use `/setrisk <amount>`.")
             return
+
+        if risk_per_trade > balance:
+            await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
+                                               text=f"Insufficient balance. Risk: ${risk_per_trade:.2f}, Available: ${balance:.2f}")
+            return
+            # --- END OF MODIFICATION ---
 
         stop_loss_distance = abs(entry - sl)
         if stop_loss_distance == 0:
@@ -476,25 +497,46 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
                                            text="Analysis failed due to zero stop-loss distance.")
             return
 
-        position_size_asset = RISK_PER_TRADE / stop_loss_distance
+        # Use the dynamic variable here instead of the constant
+        position_size_asset = risk_per_trade / stop_loss_distance
         position_size_usd = position_size_asset * entry
         trade_id = str(uuid4())
 
         # Determine direction from the entry/sl prices, not the caption
         is_long = sl < entry
 
+        # --- START: NEW TP CALCULATION LOGIC ---
         calculated_tp_levels = None
-        if tp:
-            if (is_long and tp > entry) or (not is_long and tp < entry):
-                total_profit_range = abs(tp - entry)
-                step_size = total_profit_range / 10
-                calculated_tp_levels = [
-                    {"price": entry + (step_size * i) if is_long else entry - (step_size * i), "status": "pending"} for
-                    i in range(1, 11)]
-            else:
+
+        # First, we always need the risk distance (the "R" in RR)
+        stop_loss_distance = abs(entry - sl)
+
+        # Case 1: A target price was successfully extracted from the image
+        if tp and ((is_long and tp > entry) or (not is_long and tp < entry)):
+            total_profit_range = abs(tp - entry)
+            step_size = total_profit_range / 10
+            calculated_tp_levels = [
+                {"price": entry + (step_size * i) if is_long else entry - (step_size * i), "status": "pending"} for
+                i in range(1, 11)]
+            logger.info(f"Using image-based target for {trading_pair}. Final TP: {tp}")
+
+        # Case 2: No target was found, so we calculate TPs based on a 10R target
+        else:
+            if tp:  # This handles the case where the OCR found a target, but it was invalid (on the wrong side of entry)
                 await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                               text="Warning: Target price is on the wrong side of entry. Ignoring target.")
-                tp = None
+                                               text=f"⚠️ Warning: Target price (`{tp}`) is invalid. Defaulting to 10R calculation.")
+                tp = None  # Nullify the invalid target
+
+            logger.info(f"No valid target found for {trading_pair}. Calculating 10R-based TPs.")
+
+            FINAL_RR = 10.0
+            total_profit_range = stop_loss_distance * FINAL_RR
+            step_size = total_profit_range / 10  # This conveniently simplifies to stop_loss_distance
+
+            calculated_tp_levels = [
+                {"price": entry + (step_size * i) if is_long else entry - (step_size * i), "status": "pending"} for
+                i in range(1, 11)]
+        # --- END: NEW TP CALCULATION LOGIC ---
 
         trade = PaperTrade(
             trade_id=trade_id, pair=trading_pair, entry_price=entry, sl_price=sl,
@@ -503,18 +545,29 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
             sl_moved_to_be=False
         )
 
-        app_state["open_trades"][trade_id] = trade
-        save_state()
+        db.add_trade(trade)
 
         # 4. Send the final confirmation message
         direction = "LONG" if is_long else "SHORT"
         sl_percent_display = (stop_loss_distance / entry) * 100
-        tp_message = f"**10 Partial TPs** up to `{tp}`" if tp else "Not Set"
+        tp_message = "Not Set"
+        if calculated_tp_levels:
+            final_tp_price = calculated_tp_levels[-1]['price']
+            # The number of decimals can be important for crypto, let's format it properly
+            price_format = f".{8 - len(str(int(final_tp_price)))}f"  # Dynamic precision formatting
+
+            if tp:
+                # If the original 'tp' variable exists, it was an image-based target
+                tp_message = f"**10 Partial TPs** up to `{final_tp_price:{price_format}}` (from image)"
+            else:
+                # Otherwise, it was calculated via RR
+                tp_message = f"**10 Partial TPs** calculated up to `{final_tp_price:{price_format}}` (10R)"
+        # --- END: NEW CONFIRMATION MESSAGE LOGIC ---
 
         await context.bot.send_message(
             chat_id=int(AUTHORIZED_USER_ID),
             text=f"✅ **Trade Opened for {trading_pair}** ({direction})\n\n"
-                 f"Leverage: **{leverage}x**\nRisk Amount: `${RISK_PER_TRADE:,.2f}`\n"
+                 f"Leverage: **{leverage}x**\nRisk Amount: `${risk_per_trade:,.2f}`\n"  # <-- Use the variable
                  f"Position Value (USD): `${position_size_usd:,.2f}`\n\n"
                  f"Entry: `{entry}`\nStop-Loss: `{sl}` ({sl_percent_display:.2f}% move)\n"
                  f"Take-Profit: {tp_message}\n\n"
@@ -529,12 +582,11 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles incoming signals, decides to auto-trade or ask for confirmation."""
+    """
+    Handles incoming signals with new REVERSAL logic.
+    Closes an existing trade if a new signal for the same pair has the opposite direction.
+    """
     message = update.message
-
-    # --- NEW, SIMPLIFIED AUTHORIZATION ---
-    # This single check works for all cases (direct, manual forward, monitor forward)
-    # because the message always comes from your user account.
     if message.from_user.id != int(AUTHORIZED_USER_ID):
         return
 
@@ -544,7 +596,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = message.caption
     match = re.search(r'#(\w+)', caption)
     if not match:
-        return  # Silently ignore if no hashtag
+        return
 
     pair_tag = match.group(1).upper()
 
@@ -554,26 +606,74 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     trading_pair = f"{pair_tag}USDT"
 
+    # --- NEW REVERSAL LOGIC ---
+
+    # 1. Preliminary Price Extraction
+    # We must process the image first to determine the new signal's direction.
+    photo_file_id = message.photo[-1].file_id
+    photo_file = await context.bot.get_file(photo_file_id)
+    # Use a temporary, unique filename to avoid conflicts
+    image_path = f"temp_{photo_file.file_id}.jpg"
+    await photo_file.download_to_drive(image_path)
+    extracted_prices = extract_prices_from_image(image_path)
+    os.remove(image_path)  # Clean up the temp file immediately
+
+    if not all(k in extracted_prices for k in ['entry', 'stoploss']):
+        await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
+                                       text=f"⚠️ Signal for **{trading_pair}** ignored. Could not extract entry/SL for pre-analysis.")
+        return
+
+    new_signal_is_long = extracted_prices['stoploss'] < extracted_prices['entry']
+
+    # 2. Find Existing Trade
+    # Check if a trade for this pair already exists in the database.
+    existing_trade = None
+    open_trades = db.get_open_trades()
+    for trade in open_trades:
+        if trade.pair == trading_pair:
+            existing_trade = trade
+            break
+
+    # 3. The Core Reversal Decision
+    if existing_trade:
+        # Scenario A: The directions are DIFFERENT (a true reversal)
+        if existing_trade.is_long != new_signal_is_long:
+            new_direction_text = "LONG" if new_signal_is_long else "SHORT"
+            old_direction_text = "SHORT" if new_signal_is_long else "LONG"
+
+            logger.info(f"Reversal signal for {trading_pair} detected. Closing existing {old_direction_text} position.")
+            await context.bot.send_message(
+                chat_id=int(AUTHORIZED_USER_ID),
+                text=f"⤵️ **Reversal Signal:** Closing existing trade on **{trading_pair}** to open new {new_direction_text} position."
+            )
+            # Close the existing trade at market price
+            await close_trade_by_symbol(pair_tag, context.application)
+            # IMPORTANT: We DO NOT return here. We let the function continue to open the new trade.
+
+        # Scenario B: The directions are the SAME
+        else:
+            logger.warning(f"Signal for {trading_pair} ignored. A trade in the same direction is already open.")
+            await context.bot.send_message(
+                chat_id=int(AUTHORIZED_USER_ID),
+                text=f"⚠️ **Signal Ignored:** A position for **{trading_pair}** in the same direction is already open."
+            )
+            return  # Exit the function completely.
+
+    # --- END OF NEW LOGIC ---
+
+    # 4. Proceed as Normal
+    # The rest of the function continues only if it's a new trade or a reversal.
     try:
-        # 1. Force a reload of the markets to ensure we have the latest data.
         await exchange.load_markets(True)
-
-        # 2. Use the canonical ccxt method to check for the symbol.
-        # This will raise a specific `ccxt.BadSymbol` error if it's not found.
         market = exchange.market(trading_pair)
-
-        # 3. As an extra safeguard, ensure it's a futures/swap contract.
-        # The `market` object has a `swap` flag which should be True.
         if not market.get('swap'):
             logger.error(f"Signal ignored. Pair '{trading_pair}' exists but is not a SWAP/FUTURES contract.")
             return
 
     except ccxt.BadSymbol:
-        # This is the expected error when a symbol doesn't exist.
         logger.error(f"Signal ignored. Pair '{trading_pair}' is not a valid FUTURES symbol on Binance.")
-        return  # Stop processing this signal
+        return
     except Exception as e:
-        # This catches other errors like network issues during validation.
         logger.error(f"Error validating pair with exchange: {e}", exc_info=True)
         await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
                                        text=f"An error occurred while validating the trading pair: {e}")
@@ -585,56 +685,38 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clean_caption = clean_caption.replace(word, '')
     clean_caption = re.sub(r'#\w+', '', clean_caption)
 
-    photo_file_id = message.photo[-1].file_id
-
     # --- Routing Logic ---
     if not clean_caption.strip():
         logger.info("Clean signal detected. Executing trade automatically.")
+        # Note: execute_trade will re-download and re-process the image, which is perfectly fine.
         await execute_trade(update, context, trading_pair, photo_file_id)
     else:
-        # --- THIS IS THE ENTIRE REPLACEMENT 'else' BLOCK ---
-        logger.info("Complex signal detected. Creating persistent confirmation request.")
-
-        # 1. Generate a unique ID for this request
+        # ... (The logic for asking for confirmation on complex signals remains the same)
         request_id = str(uuid4())
-
-        # 2. Forward the original message to provide context
         fwd_message = await message.forward(chat_id=int(AUTHORIZED_USER_ID))
-
-        # 3. Create the keyboard with the NEW callback_data format
         keyboard = [[
             InlineKeyboardButton("✅ Confirm Trade", callback_data=f"confirm_trade|{request_id}"),
             InlineKeyboardButton("❌ Ignore", callback_data=f"ignore_trade|{request_id}"),
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-
-        # 4. Send the confirmation buttons as a reply
         confirmation_message = await context.bot.send_message(
             chat_id=int(AUTHORIZED_USER_ID),
             text="This signal contains extra text. Please confirm to proceed:",
             reply_markup=reply_markup,
             reply_to_message_id=fwd_message.message_id
         )
-
-        # 5. Create the data packet to save
         pending_request = {
             "trading_pair": trading_pair,
             "photo_file_id": photo_file_id,
             "confirmation_message_id": confirmation_message.message_id
         }
-
-        # 6. Save it to the state and immediately to the file
         app_state["pending_confirmations"][request_id] = pending_request
-        save_state()
         logger.info(f"Saved pending confirmation with ID: {request_id}")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles all confirmation button presses using persistent state."""
     query = update.callback_query
     await query.answer()
-
-    # --- CRITICAL: Reload state to ensure we have the latest info after a restart ---
-    load_state()
 
     try:
         action, request_id = query.data.split('|')
@@ -663,7 +745,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action, request_id = query.data.split('|') # Re-split to ensure we have the ID
         if request_id in app_state.get("pending_confirmations", {}):
             del app_state["pending_confirmations"][request_id]
-            save_state()
             logger.info(f"Processed and removed pending confirmation ID: {request_id}")
 
 
@@ -673,7 +754,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 async def main():
     """Initializes and runs the bot and all background tasks."""
-    load_state()
+    db.init_db(INITIAL_BALANCE)
+
+    # Load initial state from the database into the in-memory app_state
+    app_state["balance"] = float(db.get_setting("balance"))
+    app_state["leverage"] = float(db.get_setting("leverage"))
+    logger.info(f"State loaded from DB. Balance: ${app_state['balance']:.2f}")
+
+    request = Request(connect_timeout=10, read_timeout=20)
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -682,7 +770,8 @@ async def main():
     application.add_handler(CommandHandler("help", placeholder_command))
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("positions", positions_command))
-    application.add_handler(CommandHandler("setleverage", placeholder_command))
+    application.add_handler(CommandHandler("setleverage", set_leverage_command))
+    application.add_handler(CommandHandler("setrisk", set_risk_command))
     application.add_handler(MessageHandler(filters.PHOTO & filters.CAPTION, message_handler))
     application.add_handler(CallbackQueryHandler(button_handler))
 

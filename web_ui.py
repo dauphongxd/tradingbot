@@ -3,13 +3,14 @@ import os
 from flask import Flask, render_template, redirect, url_for
 import ccxt
 import time
+import database as db
+from dataclasses import asdict
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # --- Configuration ---
-DATA_FILE = "trading_data.json"
 INITIAL_BALANCE = 1000.00  # Should match your bot's config
 
 # --- Setup ---
@@ -88,25 +89,20 @@ def calculate_pnl(trade, current_price):
 @app.route('/')
 def dashboard():
     """The main dashboard page with more robust price fetching."""
-    if not os.path.exists(DATA_FILE):
-        return "Trading data file not found. Please run the bot first to generate it.", 404
+    # This ensures the DB file and tables are created on first run.
+    db.init_db()
 
-    with open(DATA_FILE, 'r') as f:
-        try:
-            state = json.load(f)
-        except json.JSONDecodeError:
-            return "Error reading trading data file. It might be empty or corrupted.", 500
-
-    balance = state.get("balance", INITIAL_BALANCE)
-    leverage = state.get("leverage", 20.0)
-    open_trades_data = state.get("open_trades", {})
-    trade_history = state.get("trade_history", [])
+    balance = float(db.get_setting("balance"))
+    leverage = float(db.get_setting("leverage"))
+    open_trades_objects = db.get_open_trades()
+    trade_history = db.get_trade_history()
+    open_trades_data = [asdict(trade) for trade in open_trades_objects]
     stats = calculate_stats(trade_history)
 
     total_floating_pnl = 0.0
     processed_trades = []
 
-    for trade_id, trade in open_trades_data.items():
+    for trade in open_trades_data:
         try:
             # --- NEW: Fetch ticker for each trade individually ---
             ticker = safe_sync_exchange_call(exchange.fetch_ticker, trade['pair'])
@@ -138,20 +134,16 @@ def dashboard():
                            trades=processed_trades,
                            floating_pnl=total_floating_pnl,
                            equity=equity,
-                           stats=stats,  # <-- Pass stats to template
-                           trade_history=reversed(trade_history))  # <-- Pass history, newest first
+                           stats=stats,
+                           trade_history=trade_history)  # Already sorted newest first
 
 
 @app.route('/close_trade/<trade_id>')
 def close_trade(trade_id):
     """Endpoint to manually close a trade using the remaining size."""
-    if not os.path.exists(DATA_FILE): return "Data file not found.", 404
-    with open(DATA_FILE, 'r') as f:
-        state = json.load(f)
-    open_trades = state.get("open_trades", {})
-    if trade_id not in open_trades:
+    trade_to_close = db.get_trade_by_id(trade_id)
+    if not trade_to_close:
         return "Trade ID not found.", 404
-    trade_to_close = open_trades[trade_id]
     try:
         ticker = safe_sync_exchange_call(exchange.fetch_ticker, trade_to_close['pair'])
 
@@ -164,17 +156,19 @@ def close_trade(trade_id):
         # --- END NEW ---
 
         exit_price = ticker['last']
-        price_diff = exit_price - trade_to_close['entry_price']
-        if not trade_to_close['is_long']:
+        price_diff = exit_price - trade_to_close.entry_price
+        if not trade_to_close.is_long:
             price_diff = -price_diff
 
-        # --- CRITICAL CHANGE: Use remaining_size for PNL ---
-        pnl = price_diff * trade_to_close['remaining_size']
+        pnl = price_diff * trade_to_close.remaining_size
 
-        state['balance'] += pnl
-        del state['open_trades'][trade_id]
-        with open(DATA_FILE, 'w') as f:
-            json.dump(state, f, indent=4)
+        # Update balance in the DB
+        current_balance = float(db.get_setting("balance"))
+        new_balance = current_balance + pnl
+        db.update_setting("balance", new_balance)
+
+        # Atomically move the trade to history
+        db.close_trade(trade_id, "MANUAL_CLOSE_UI", exit_price, pnl)
 
         # --- Send a notification to the bot's user ---
         # This is an optional but nice feature
@@ -182,10 +176,10 @@ def close_trade(trade_id):
         user_id = os.getenv('AUTHORIZED_USER_ID')  # And your ID here
         message = (
             f"🔵🔵🔵 MANUAL CLOSE 🔵🔵🔵\n\n"
-            f"Trade Closed: **{trade_to_close['pair']}**\n"
+            f"Trade Closed: **{trade_to_close.pair}**\n"
             f"Exit: `{exit_price}`\n"
             f"PNL: `${pnl:,.2f}`\n\n"
-            f"**New Balance: `${state['balance']:,.2f}`**"
+            f"**New Balance: `${new_balance:,.2f}`**"
         )
         # We need a synchronous way to send a message here
         import requests
