@@ -14,7 +14,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from extract_price import extract_prices_from_image
-from telegram.request import Request
 import database as db
 
 from dotenv import load_dotenv
@@ -761,9 +760,13 @@ async def main():
     app_state["leverage"] = float(db.get_setting("leverage"))
     logger.info(f"State loaded from DB. Balance: ${app_state['balance']:.2f}")
 
-    request = Request(connect_timeout=10, read_timeout=20)
-
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(10)
+        .read_timeout(20)
+        .build()
+    )
 
     # Register command handlers
     application.add_handler(CommandHandler("start", placeholder_command))
