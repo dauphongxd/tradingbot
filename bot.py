@@ -445,6 +445,49 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, parse_mode='Markdown')
 
 
+async def tplevels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the status of all TP levels for a specific open trade."""
+    if update.message.from_user.id != int(AUTHORIZED_USER_ID):
+        return  # Ignore commands from unauthorized users
+
+    try:
+        # Get the coin symbol from the command arguments
+        symbol = context.args[0].upper()
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: `/tplevels <SYMBOL>` (e.g., `/tplevels AVAX`)", parse_mode='Markdown')
+        return
+
+    # Find the trade in the database
+    open_trades = db.get_open_trades()
+    target_trade = None
+    for trade in open_trades:
+        # Check if the trade's pair starts with the symbol (e.g., 'AVAXUSDT' starts with 'AVAX')
+        if trade.pair.startswith(symbol + 'USDT'):
+            target_trade = trade
+            break
+
+    if not target_trade:
+        await update.message.reply_text(f"❌ No open trade found for **{symbol}**.", parse_mode='Markdown')
+        return
+
+    if not target_trade.tp_levels:
+        await update.message.reply_text(f"⚠️ No Take Profit levels are set for the **{target_trade.pair}** trade.", parse_mode='Markdown')
+        return
+
+    # Format the message with the TP levels
+    message = f"🎯 **Take Profit Status for {target_trade.pair}**\n\n"
+    message += f"**Entry Price:** `{target_trade.entry_price}`\n"
+    message += f"**Stop-Loss:** `{target_trade.sl_price}`\n\n"
+
+    for i, level in enumerate(target_trade.tp_levels):
+        status_emoji = "✅" if level['status'] == 'hit' else "⏰"
+        price = level['price']
+        status_text = level['status'].capitalize()
+
+        message += f"{status_emoji} **TP {i + 1}:** `{price}` ({status_text})\n"
+
+    await update.message.reply_text(message, parse_mode='Markdown')
+
 async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trading_pair: str, photo_file_id: str):
     """Downloads an image from a file_id, extracts prices, and opens a trade."""
     try:
@@ -799,6 +842,7 @@ async def main():
     application.add_handler(CommandHandler("help", placeholder_command))
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("positions", positions_command))
+    application.add_handler(CommandHandler("tplevels", tplevels_command))
     application.add_handler(CommandHandler("setleverage", set_leverage_command))
     application.add_handler(CommandHandler("setrisk", set_risk_command))
     application.add_handler(MessageHandler(filters.PHOTO & filters.CAPTION, message_handler))
