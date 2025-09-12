@@ -12,8 +12,16 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 # 1. Get these from my.telegram.org
-API_ID = os.getenv("API_ID")  # Replace with your API ID
-API_HASH = os.getenv("API_HASH")  # Replace with your API Hash
+
+# --- THIS IS THE FIX ---
+try:
+    API_ID = int(os.getenv("API_ID"))
+    API_HASH = os.getenv("API_HASH")
+except (ValueError, TypeError):
+    print("FATAL ERROR: Could not load API_ID or API_HASH from .env file.")
+    print("Please ensure your .env file is correct and contains numeric API_ID.")
+    exit()
+# --- END FIX ---
 
 # 2. The name of the session file to be created
 SESSION_NAME = 'trading_monitor_session'
