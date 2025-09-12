@@ -48,24 +48,40 @@ with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
         before acting, checking if the message was deleted during the wait.
         """
         message = event.message
+
+        # --- NEW: Enhanced Logging ---
+        logger.info(f"--- New message detected (ID: {message.id}) ---")
         caption = message.text.lower() if message.text else ""
 
-        # --- Initial Filtering (same as before) ---
+        if not caption:
+            logger.info("SKIPPED: Message has no text caption.")
+            return
+
+        logger.info(f"Message content: \"{caption}\". Checking for signals...")
+        # --- END: Enhanced Logging ---
+
+        # --- Initial Filtering (with more logging) ---
         match = re.search(r'#(\w+)', caption)
-        if not match: return
+        if not match:
+            logger.info("SKIPPED: No coin symbol (#...) found in caption.")
+            return
 
         coin_symbol = match.group(1).upper()
+        logger.info(f"Found Coin Symbol: #{coin_symbol}")
 
         is_close_signal = any(word in caption for word in CLOSE_WORDS)
         is_open_signal = any(word in caption for word in BUY_WORDS.union(SELL_WORDS))
 
         # If it's not a recognized signal type, ignore it immediately
         if not is_open_signal and not is_close_signal:
+            logger.info(f"SKIPPED: No trade keywords ({', '.join(ALL_KEYWORDS)}) found.")
             return
+
+        logger.info(f"Signal type identified -> Is Open Signal: {is_open_signal}, Is Close Signal: {is_close_signal}")
 
         # --- NEW: DELAY AND DELETION CHECK ---
         message_id = message.id
-        logger.info(f"Signal for #{coin_symbol} detected. Waiting 60 seconds for confirmation...")
+        logger.info(f"VALID SIGNAL: #{coin_symbol} detected. Waiting 60 seconds for confirmation...")
 
         # Wait for 60 seconds
         await asyncio.sleep(60)
@@ -74,13 +90,13 @@ with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
         try:
             refetched_message = await client.get_messages(int(SOURCE_CHANNEL_ID), ids=message_id)
             if not refetched_message:
-                logger.warning(f"Signal for #{coin_symbol} (ID: {message_id}) was DELETED. Canceling action.")
+                logger.warning(f"CANCELLED: Signal for #{coin_symbol} (ID: {message_id}) was DELETED.")
                 return
         except Exception as e:
             logger.error(f"Could not re-fetch message {message_id}. Assuming it was deleted. Error: {e}")
             return
 
-        logger.info(f"Signal for #{coin_symbol} confirmed. Proceeding with action.")
+        logger.info(f"CONFIRMED: Signal for #{coin_symbol} still exists. Proceeding to forward...")
         # --- END NEW LOGIC ---
 
         # --- ACTION LOGIC (moved from the top) ---
@@ -92,14 +108,17 @@ with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
             clean_caption = re.sub(r'#\w+', '', clean_caption)
 
             if not clean_caption.strip():
+                logger.info(f"Action: Sending /close_by_symbol command to bot.")
                 await client.send_message(DESTINATION_BOT_ID, f"/close_by_symbol {coin_symbol}")
             else:
+                logger.info(f"Action: Forwarding close signal with extra text to bot.")
                 await message.forward_to(DESTINATION_BOT_ID)
             return
 
         # 2. Only if it's NOT a close signal, check if it's an OPEN signal.
         elif is_open_signal:
             if message.photo:
+                logger.info(f"Action: Forwarding open signal (with photo) to bot.")
                 await message.forward_to(DESTINATION_BOT_ID)
 
 
