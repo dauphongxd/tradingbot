@@ -452,7 +452,11 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
 
         entry = extracted['entry']
         sl = extracted['stoploss']
-        is_long = sl < entry # Determine direction based on prices
+        is_long = sl < entry  # Determine direction based on prices
+
+        # --- THIS IS THE FIX ---
+        tp = None
+        # --- END FIX ---
 
         if (is_long and entry <= sl) or (not is_long and entry >= sl):
             await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
@@ -481,12 +485,12 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
         if risk_per_trade is None:
             # Fallback in case it's not set yet in the DB
             await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                               text="⚠️ **CRITICAL:** Risk per trade is not set. Please use `/setrisk <amount>`.")
+                                           text="⚠️ **CRITICAL:** Risk per trade is not set. Please use `/setrisk <amount>`.")
             return
 
         if risk_per_trade > balance:
             await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                               text=f"Insufficient balance. Risk: ${risk_per_trade:.2f}, Available: ${balance:.2f}")
+                                           text=f"Insufficient balance. Risk: ${risk_per_trade:.2f}, Available: ${balance:.2f}")
             return
             # --- END OF MODIFICATION ---
 
