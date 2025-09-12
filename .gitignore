@@ -3,3 +3,4 @@ images/
 labels/
 "price detection.v1i.yolov8/"
 .env
+trading_monitor_session.session

@@ -7,6 +7,7 @@ import re
 import os
 from uuid import uuid4
 from dataclasses import dataclass, asdict
+import json
 
 import ccxt.async_support as ccxt
 from telegram import Update
@@ -42,6 +43,19 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)  # Quieter HTTP logs
 logger = logging.getLogger(__name__)
 
+SYMBOL_ALIASES = {}
+
+def load_symbol_aliases():
+    """Loads the symbol alias map from a JSON file."""
+    global SYMBOL_ALIASES
+    try:
+        with open("symbol_aliases.json", "r") as f:
+            SYMBOL_ALIASES = json.load(f)
+        logger.info(f"✅ Loaded {len(SYMBOL_ALIASES)} symbol aliases from symbol_aliases.json")
+    except FileNotFoundError:
+        logger.warning("⚠️ symbol_aliases.json not found. No symbol aliases will be used.")
+    except json.JSONDecodeError:
+        logger.error("❌ Could not decode symbol_aliases.json. Please check for syntax errors in the file.")
 
 # ==============================================================================
 #  Refactored PaperTrade Data Class
@@ -603,6 +617,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pair_tag = match.group(1).upper()
 
+    # --- NEW: Symbol Alias Correction Logic ---
+    lookup_key = pair_tag.lower()  # Look up using a consistent lowercase key
+    if lookup_key in SYMBOL_ALIASES:
+        original_tag = pair_tag
+        pair_tag = SYMBOL_ALIASES[lookup_key].upper()  # Replace with the correct value
+        logger.info(f"Symbol alias applied: Corrected signal for #{original_tag} to #{pair_tag}")
+
     if pair_tag in BLACKLISTED_COINS:
         logger.warning(f"Signal for #{pair_tag} ignored because it is on the blacklist.")
         return
@@ -758,6 +779,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     """Initializes and runs the bot and all background tasks."""
     db.init_db(INITIAL_BALANCE)
+    load_symbol_aliases()
 
     # Load initial state from the database into the in-memory app_state
     app_state["balance"] = float(db.get_setting("balance"))
