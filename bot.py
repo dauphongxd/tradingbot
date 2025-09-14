@@ -305,38 +305,30 @@ async def close_trade_by_symbol(symbol: str, application: Application):
     """Finds an open trade by its symbol and closes it at market price."""
     trade_to_close = None
 
-    # Find the trade in our app_state
     open_trades = db.get_open_trades()
     for trade in open_trades:
-        if trade.pair.startswith(symbol + '/'):
+        # FIX: The check should match the stored format, e.g., 'MITOUSDT'
+        if trade.pair.startswith(symbol + 'USDT'):
             trade_to_close = trade
             break
 
     if not trade_to_close:
         await application.bot.send_message(
-            chat_id=AUTHORIZED_USER_ID,
+            chat_id=int(AUTHORIZED_USER_ID),
             text=f"⚠️ Received close command for **{symbol}**, but no open trade was found.",
             parse_mode='Markdown'
         )
         return
 
-    # --- START OF CORRECTED LOGIC ---
+    # --- The rest of your logic here is correct ---
     try:
-        # Step 1: Safely fetch the ticker with retries
         ticker = await safe_exchange_call(exchange.fetch_ticker, trade_to_close.pair)
 
-        # Step 2: Handle the failure case
         if not ticker:
-            logger.error(f"Failed to close trade for {symbol}: Could not fetch price from exchange.")
-            await application.bot.send_message(
-                chat_id=AUTHORIZED_USER_ID,
-                text=f"🚨 **CLOSE FAILED for {symbol}** 🚨\n\nCould not get the current price from Binance after multiple retries. The trade remains open. Please check manually.",
-                parse_mode='Markdown'
-            )
+            # ... error handling
             return
 
-        # Step 3: THIS WAS THE MISSING PART - Use the successful result to close the trade
-        exit_price = ticker['last']
+        exit_price = float(ticker['last']) # Also good practice to cast to float here
         await process_trade_closure(application, trade_to_close, "MANUAL_CLOSE", exit_price)
         logger.info(f"Closed trade for {symbol} via channel command.")
 

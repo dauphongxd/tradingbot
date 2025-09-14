@@ -140,20 +140,17 @@ def dashboard():
 
 @app.route('/close_trade/<trade_id>')
 def close_trade(trade_id):
-    """Endpoint to manually close a trade using the remaining size."""
     trade_to_close = db.get_trade_by_id(trade_id)
     if not trade_to_close:
         return "Trade ID not found.", 404
     try:
-        ticker = safe_sync_exchange_call(exchange.fetch_ticker, trade_to_close['pair'])
+        # FIX: Use dot notation to access the attribute of the PaperTrade object
+        ticker = safe_sync_exchange_call(exchange.fetch_ticker, trade_to_close.pair)
 
         # If we failed to get a price, we can't close the trade.
         if not ticker:
             print(f"CRITICAL: Failed to close trade {trade_id} via UI. Could not fetch price.")
-            # We just redirect, the user will see the trade is still open.
-            # In a more advanced UI, you would flash an error message.
             return redirect(url_for('dashboard'))
-        # --- END NEW ---
 
         exit_price = ticker['last']
         price_diff = exit_price - trade_to_close.entry_price
