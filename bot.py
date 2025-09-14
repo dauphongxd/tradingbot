@@ -135,6 +135,9 @@ async def market_monitor(application: Application):
 
             tickers = await safe_exchange_call(exchange.fetch_tickers, pairs_to_watch)
 
+            if tickers:
+                print(f"DEBUG: Ticker keys received from exchange: {list(tickers.keys())}")
+
             if not tickers:
                 logger.critical("[Monitor] Could not fetch market data from exchange. It may be down. Pausing for 60s.")
                 await application.bot.send_message(
