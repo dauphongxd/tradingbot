@@ -127,7 +127,6 @@ async def market_monitor(application: Application):
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            # This part is correct, it creates a list like ['MITOUSDT', 'BANKUSDT']
             pairs_to_watch = list(set(trade.pair for trade in open_trades))
             if not pairs_to_watch:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -145,24 +144,28 @@ async def market_monitor(application: Application):
                 continue
 
             for trade in open_trades:
-                # --- START OF THE FIX ---
-                # Step 1: Check for the pair directly, as ccxt returns the same format.
-                if trade.pair not in tickers:
+                # --- START OF THE DEFINITIVE FIX ---
+                # Step 1: Convert the stored pair ('MITOUSDT') to the EXACT standardized format ('MITO/USDT:USDT').
+                standardized_symbol = trade.pair.replace("USDT", "/USDT:USDT")
+
+                # Step 2: Use the correct symbol to check if the ticker exists.
+                if standardized_symbol not in tickers:
+                    # This check will now pass.
                     continue
 
-                # Step 2: Safely get the price and cast it to a float.
+                # Step 3: Safely get the price using the correct key and cast it to a float.
                 try:
-                    current_price = float(tickers[trade.pair]['last'])
+                    current_price = float(tickers[standardized_symbol]['last'])
                 except (ValueError, TypeError, KeyError):
-                    logger.warning(f"Could not parse 'last' price from ticker data for {trade.pair}.")
+                    logger.warning(f"Could not parse 'last' price from ticker data for {standardized_symbol}.")
                     continue
-                # --- END OF THE FIX ---
+                # --- END OF THE DEFINITIVE FIX ---
 
                 # --- 1. Check for STOP LOSS hit ---
                 if (trade.is_long and current_price <= trade.sl_price) or \
                         (not trade.is_long and current_price >= trade.sl_price):
                     await process_trade_closure(application, trade, "SL_HIT", trade.sl_price)
-                    continue  # Move to the next trade
+                    continue
 
                 # --- 2. Check for PARTIAL TAKE PROFIT hits ---
                 if trade.tp_levels:
