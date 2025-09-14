@@ -119,7 +119,6 @@ async def safe_exchange_call(func, *args, **kwargs):
 # ==============================================================================
 async def market_monitor(application: Application):
     """The 'control tower' that now checks for SL, manual closures, and partial TPs."""
-    # ... (The first part of the function reloading state from the file is the same) ...
     logger.info("Market monitor started.")
     while True:
         try:
@@ -127,6 +126,8 @@ async def market_monitor(application: Application):
             if not open_trades:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
+
+            # This part is correct, it creates a list like ['MITOUSDT', 'BANKUSDT']
             pairs_to_watch = list(set(trade.pair for trade in open_trades))
             if not pairs_to_watch:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -134,44 +135,34 @@ async def market_monitor(application: Application):
 
             tickers = await safe_exchange_call(exchange.fetch_tickers, pairs_to_watch)
 
-            # If tickers is None, it means all retries failed.
             if not tickers:
                 logger.critical("[Monitor] Could not fetch market data from exchange. It may be down. Pausing for 60s.")
-                # Optional: Send an alert to the user that the monitor is struggling
                 await application.bot.send_message(
-                    chat_id=AUTHORIZED_USER_ID,
+                    chat_id=int(AUTHORIZED_USER_ID),
                     text="🚨 **CRITICAL: Market Monitor** 🚨\n\nCould not connect to Binance to check SL/TP for open trades. The exchange may be down for maintenance. Will keep retrying."
                 )
-                await asyncio.sleep(60)  # Wait a longer time before the next full loop
-                continue  # Skip the rest of this loop iteration
+                await asyncio.sleep(60)
+                continue
 
             for trade in open_trades:
-                # --- FIX: Convert the stored pair ('MITOUSDT') to the standardized ccxt format ('MITO/USDT') for lookup ---
-                standardized_symbol = trade.pair.replace("USDT", "/USDT")
-
-                if standardized_symbol not in tickers:
-                    # Add a log to see if this is ever happening
-                    logger.debug(
-                        f"Could not find ticker data for {standardized_symbol}. Tickers received: {tickers.keys()}")
+                # --- START OF THE FIX ---
+                # Step 1: Check for the pair directly, as ccxt returns the same format.
+                if trade.pair not in tickers:
                     continue
 
-                # Now, use the standardized symbol to get the ticker data
-                ticker_data = tickers[standardized_symbol]
-
-                # --- FIX 2: Explicitly cast the price to a float for safe comparison ---
+                # Step 2: Safely get the price and cast it to a float.
                 try:
-                    current_price = float(ticker_data['last'])
+                    current_price = float(tickers[trade.pair]['last'])
                 except (ValueError, TypeError, KeyError):
-                    logger.warning(
-                        f"Could not parse 'last' price from ticker data for {trade.pair}. Data: {ticker_data}")
-                    continue  # Skip to the next trade if price is invalid
+                    logger.warning(f"Could not parse 'last' price from ticker data for {trade.pair}.")
+                    continue
+                # --- END OF THE FIX ---
 
                 # --- 1. Check for STOP LOSS hit ---
-                # The rest of your logic from here down remains exactly the same...
                 if (trade.is_long and current_price <= trade.sl_price) or \
                         (not trade.is_long and current_price >= trade.sl_price):
                     await process_trade_closure(application, trade, "SL_HIT", trade.sl_price)
-                    continue
+                    continue  # Move to the next trade
 
                 # --- 2. Check for PARTIAL TAKE PROFIT hits ---
                 if trade.tp_levels:
@@ -180,27 +171,20 @@ async def market_monitor(application: Application):
                             if (trade.is_long and current_price >= level['price']) or \
                                     (not trade.is_long and current_price <= level['price']):
 
-                                # First, process the partial closure as always
                                 await process_partial_tp_closure(application, trade, level, i)
 
                                 # --- NEW HYBRID STOP-LOSS LOGIC ---
                                 new_sl_price = None
                                 notification_reason = ""
 
-                                # The TRIGGER: If TP2 (index 1) is hit, move SL to Break-Even
                                 if i == 1 and not trade.sl_moved_to_be:
                                     new_sl_price = trade.entry_price
-                                    trade.sl_moved_to_be = True  # Set the flag so this only runs once
+                                    trade.sl_moved_to_be = True
                                     notification_reason = "TP2 hit. Trade is now risk-free."
-
-                                # The TRAIL: If TP3 or higher is hit, trail the SL to the TP level from two steps ago
                                 elif i > 1:
-                                    # e.g., When TP3 (i=2) is hit, move SL to TP1 (i-2=0)
-                                    # e.g., When TP4 (i=3) is hit, move SL to TP2 (i-2=1)
                                     new_sl_price = trade.tp_levels[i - 2]['price']
                                     notification_reason = f"TP{i + 1} hit. Trailing stop-loss updated."
 
-                                # If we determined a new SL is needed, update and notify
                                 if new_sl_price and new_sl_price != trade.sl_price:
                                     original_sl = trade.sl_price
                                     trade.sl_price = new_sl_price
@@ -213,10 +197,9 @@ async def market_monitor(application: Application):
                                         f"**New SL: `{trade.sl_price}`**"
                                     )
                                     await application.bot.send_message(
-                                        chat_id=AUTHORIZED_USER_ID, text=message, parse_mode='Markdown'
+                                        chat_id=int(AUTHORIZED_USER_ID), text=message, parse_mode='Markdown'
                                     )
-                                    logger.info(
-                                        f"Moved SL for trade {trade.trade_id} to {trade.sl_price}. Reason: {notification_reason}")
+                                    logger.info(f"Moved SL for trade {trade.trade_id} to {trade.sl_price}. Reason: {notification_reason}")
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
         except ccxt.NetworkError as e:
