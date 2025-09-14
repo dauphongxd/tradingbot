@@ -145,10 +145,14 @@ async def market_monitor(application: Application):
                 await asyncio.sleep(60)  # Wait a longer time before the next full loop
                 continue  # Skip the rest of this loop iteration
 
-
             for trade in open_trades:
                 if trade.pair not in tickers: continue
-                current_price = tickers[trade.pair]['last']
+                try:
+                    current_price = float(tickers[trade.pair]['last'])
+                except (ValueError, TypeError):
+                    logger.warning(f"Could not parse price for {trade.pair}. Skipping check for this cycle.")
+                    continue  # Skip to the next trade if price is invalid
+
                 exit_price = None
                 status = None
 
