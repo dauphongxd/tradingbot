@@ -63,7 +63,10 @@
                             <th>Direction</th>
                             <th>Entry</th>
                             <th>Stop Loss</th>
-                            <th>Take Profit</th>
+                            <th>Final TP</th>
+                            <!-- ADDED -->
+                            <th>TP Progress</th>
+                            <!-- /ADDED -->
                             <th>Current P/L</th>
                             <th>Current Price</th>
                             <th>Actions</th>
@@ -88,15 +91,34 @@
                             <!-- Stop Loss -->
                             <td>{{ trade.sl_price }}</td>
 
-                            <!-- Take Profit (Simplified) -->
+                            <!-- Final Take Profit -->
                             <td>
                                 {% if trade.tp_levels %}
                                     <!-- Display the price of the very last TP level -->
-                                    {{ "%.2f"|format(trade.tp_levels[-1].price) }}
+                                    {{ "%.4f"|format(trade.tp_levels[-1].price) }}
                                 {% else %}
                                     N/A
                                 {% endif %}
                             </td>
+
+                            <!-- ADDED: TP Progress Column -->
+                            <td>
+                                {% if trade.tp_levels %}
+                                    {#- Create a counter to track hit TPs -#}
+                                    {% set hit_count = namespace(value=0) %}
+                                    {% for level in trade.tp_levels %}
+                                        {% if level.status == 'hit' %}
+                                            {% set hit_count.value = hit_count.value + 1 %}
+                                        {% endif %}
+                                    {% endfor %}
+                                    <span class="tp-progress">
+                                        {{ hit_count.value }} / {{ trade.tp_levels|length }}
+                                    </span>
+                                {% else %}
+                                    N/A
+                                {% endif %}
+                            </td>
+                            <!-- /ADDED -->
 
                             <!-- Current P/L -->
                             <td>
@@ -112,7 +134,7 @@
                             <!-- Current Price -->
                             <td class="current-price">
                                 {% if trade.current_price is number %}
-                                    {{ "%.2f"|format(trade.current_price) }}
+                                    {{ "%.4f"|format(trade.current_price) }}
                                 {% else %}
                                     {{ trade.current_price }}
                                 {% endif %}
@@ -158,8 +180,8 @@
                                     {{ closed_trade.direction }}
                                 </span>
                             </td>
-                            <td>{{ "%.2f"|format(closed_trade.entry_price) }}</td>
-                            <td>{{ "%.2f"|format(closed_trade.exit_price) }}</td>
+                            <td>{{ "%.4f"|format(closed_trade.entry_price) }}</td>
+                            <td>{{ "%.4f"|format(closed_trade.exit_price) }}</td>
                             <td>{{ closed_trade.status }}</td>
                             <td>
                                 <span class="{{ 'profit' if closed_trade.pnl >= 0 else 'loss' }}">

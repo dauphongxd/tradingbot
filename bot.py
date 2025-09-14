@@ -204,8 +204,6 @@ async def market_monitor(application: Application):
                                     logger.info(
                                         f"Moved SL for trade {trade.trade_id} to {trade.sl_price}. Reason: {notification_reason}")
 
-                            break  # Only check the next pending level in each loop
-
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
         except ccxt.NetworkError as e:
             logger.error(f"[Monitor] Network error: {e}. Retrying in 30s.")
