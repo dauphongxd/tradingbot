@@ -363,34 +363,67 @@ async def set_leverage_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def set_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /setrisk command to dynamically update RISK_PER_TRADE."""
+    """Handles the /setrisk command to dynamically update risk, supporting fixed $ and %."""
     if update.message.from_user.id != int(AUTHORIZED_USER_ID):
         return
 
     try:
-        # Get the new risk value from the command arguments
-        new_risk = float(context.args[0])
+        # Get the risk value as a string from the command arguments
+        risk_input = context.args[0]
         current_balance = float(db.get_setting("balance"))
+        risk_value_to_store = ""
+        reply_message = ""
 
-        if new_risk <= 0:
-            await update.message.reply_text("⚠️ **Invalid Value:** Risk must be a positive number.")
-            return
-        if new_risk > current_balance:
-            await update.message.reply_text(f"⚠️ **Warning:** New risk `${new_risk:,.2f}` is higher than your current balance of `${current_balance:,.2f}`.")
+        # Check if the input is a percentage
+        if risk_input.endswith('%'):
+            try:
+                percentage = float(risk_input[:-1]) # Remove '%' and convert
+                if not (0 < percentage <= 100):
+                    await update.message.reply_text("⚠️ **Invalid Value:** Percentage risk must be between 0 and 100.")
+                    return
 
-        # This is the key: we need a way to store and retrieve this value.
-        # Let's use our database for this.
-        db.update_setting("risk_per_trade", new_risk)
+                risk_value_to_store = f"{percentage}%"
+                calculated_risk_amount = (percentage / 100) * current_balance
+                reply_message = (
+                    f"✅ **Risk Updated** ✅\n\n"
+                    f"New risk per trade is now **{percentage:.2f}%** of your balance.\n"
+                    f"On your current balance, this is **${calculated_risk_amount:,.2f}**."
+                )
+            except ValueError:
+                await update.message.reply_text("⚠️ **Invalid Format:** Please enter a valid number for the percentage (e.g., `5%`).")
+                return
+        # Otherwise, treat it as a fixed dollar amount
+        else:
+            try:
+                new_risk = float(risk_input)
+                if new_risk <= 0:
+                    await update.message.reply_text("⚠️ **Invalid Value:** Risk must be a positive number.")
+                    return
+                if new_risk > current_balance:
+                    await update.message.reply_text(f"⚠️ **Warning:** New risk `${new_risk:,.2f}` is higher than your current balance of `${current_balance:,.2f}`.")
 
-        logger.info(f"Risk per trade updated to ${new_risk:,.2f} by user command.")
+                risk_value_to_store = str(new_risk)
+                reply_message = (
+                    f"✅ **Risk Updated** ✅\n\n"
+                    f"New risk per trade is now fixed at **${new_risk:,.2f}**."
+                )
+            except ValueError:
+                await update.message.reply_text("⚠️ **Invalid Format:** Please enter a valid number for the amount (e.g., `50`).")
+                return
+
+        # Save the validated value (either "50" or "5%") to the database
+        db.update_setting("risk_per_trade", risk_value_to_store)
+
+        logger.info(f"Risk per trade updated to '{risk_value_to_store}' by user command.")
+        await update.message.reply_text(reply_message, parse_mode='Markdown')
+
+    except IndexError:
         await update.message.reply_text(
-            f"✅ **Risk Updated** ✅\n\n"
-            f"New risk per trade is now **${new_risk:,.2f}**.",
+            "**Usage:**\n"
+            "- `/setrisk <dollar_amount>` (e.g., `/setrisk 50`)\n"
+            "- `/setrisk <percentage>%` (e.g., `/setrisk 5%`)",
             parse_mode='Markdown'
         )
-
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: `/setrisk <dollar_amount>` (e.g., `/setrisk 50`)", parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in set_risk_command: {e}", exc_info=True)
         await update.message.reply_text(f"An error occurred: {e}")
@@ -531,16 +564,25 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
 
         # --- START OF MODIFICATION ---
         # Fetch the risk amount dynamically from the database
-        risk_per_trade = float(db.get_setting('risk_per_trade'))
-        if risk_per_trade is None:
-            # Fallback in case it's not set yet in the DB
+        risk_setting = db.get_setting('risk_per_trade')
+        risk_per_trade = 0.0  # This will hold the final calculated dollar amount
+
+        if not risk_setting:
             await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                           text="⚠️ **CRITICAL:** Risk per trade is not set. Please use `/setrisk <amount>`.")
+                                           text="⚠️ **CRITICAL:** Risk per trade is not set. Please use `/setrisk`.")
             return
+
+        # Check if the setting is a percentage
+        if '%' in risk_setting:
+            percentage = float(risk_setting.strip('%'))
+            risk_per_trade = (percentage / 100) * balance
+        # Otherwise, it's a fixed amount
+        else:
+            risk_per_trade = float(risk_setting)
 
         if risk_per_trade > balance:
             await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                           text=f"Insufficient balance. Risk: ${risk_per_trade:.2f}, Available: ${balance:.2f}")
+                                           text=f"Insufficient balance. Calculated Risk: ${risk_per_trade:,.2f}, Available: ${balance:,.2f}")
             return
             # --- END OF MODIFICATION ---
 

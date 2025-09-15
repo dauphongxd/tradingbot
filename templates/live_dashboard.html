@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="15">
+    <title>LIVE Testnet Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>LIVE Testnet Dashboard <span style="color: #ef5350;">(REAL ORDERS)</span></h1>
+
+        <!-- The summary grid is simplified because live stats are slow to calculate -->
+        <div class="summary-grid">
+            <div class="card">
+                <h2>Balance</h2>
+                <p>${{ "%.2f"|format(balance|float) }}</p>
+            </div>
+            <div class="card">
+                <h2>Floating P/L</h2>
+                <p class="{{ 'profit' if floating_pnl >= 0 else 'loss' }}">
+                    ${{ "%.2f"|format(floating_pnl|float) }}
+                </p>
+            </div>
+            <div class="card">
+                <h2>Equity</h2>
+                <p>${{ "%.2f"|format(equity|float) }}</p>
+            </div>
+            <div class="card">
+                <h2>Risk Per Trade</h2>
+                <p>{{ risk }}</p>
+            </div>
+        </div>
+
+        <!-- Section 1: Your Active Positions -->
+        <h2>Open Positions ({{ open_positions|length }})</h2>
+        <div class="table-container">
+            {% if open_positions %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Pair</th>
+                            <th>Direction</th>
+                            <th>Size</th>
+                            <th>Entry Price</th>
+                            <th>Mark Price</th>
+                            <th>Liq. Price</th>
+                            <th>Unrealized PNL</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for position in open_positions %}
+                        <tr>
+                            <td>{{ position.symbol }}</td>
+                            <td>
+                                <span class="{{ 'long' if position.side == 'long' else 'short' }}">
+                                    {{ position.side|upper }}
+                                </span>
+                            </td>
+                            <td>{{ position.contracts|float }}</td>
+                            <td>{{ "%.4f"|format(position.entryPrice|float) }}</td>
+                            <td>{{ "%.4f"|format(position.markPrice|float) }}</td>
+                            <td>{{ "%.4f"|format(position.liquidationPrice|float) }}</td>
+                            <td>
+                                <span class="{{ 'profit' if position.unrealizedPnl|float >= 0 else 'loss' }}">
+                                    ${{ "%.2f"|format(position.unrealizedPnl|float) }}
+                                </span>
+                            </td>
+                            <td>
+                                <a href="{{ url_for('close_trade', symbol=position.symbol) }}"
+                                   class="close-button"
+                                   onclick="return confirm('Are you sure you want to close the {{position.symbol}} position on the exchange?');">
+                                   &times;
+                                </a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <p>No open positions on the exchange.</p>
+            {% endif %}
+        </div>
+
+        <!-- Section 2: Your Pending SL and TP Orders -->
+        <h2>Open Orders ({{ open_orders|length }})</h2>
+        <div class="table-container">
+            {% if open_orders %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Pair</th>
+                            <th>Type</th>
+                            <th>Side</th>
+                            <th>Amount</th>
+                            <th>Trigger Price</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for order in open_orders %}
+                        <tr>
+                            <td>{{ order.symbol }}</td>
+                            <td>{{ order.type|replace('_', ' ')|upper }}</td>
+                            <td>
+                                <span class="{{ 'long' if order.side == 'buy' else 'short' }}">
+                                    {{ order.side|upper }}
+                                </span>
+                            </td>
+                            <td>{{ order.amount|float }}</td>
+                            <td>{{ "%.4f"|format(order.price|float) }}</td>
+                            <td>{{ order.status|capitalize }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <p>No pending Stop Loss or Take Profit orders.</p>
+            {% endif %}
+        </div>
+
+        <p class="footer">Page automatically refreshes every 15 seconds. Data is from Binance Testnet.</p>
+    </div>
+</body>
+</html>

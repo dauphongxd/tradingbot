@@ -51,6 +51,10 @@
                 <h2>Leverage</h2>
                 <p>{{ leverage }}x</p>
             </div>
+            <div class="card">
+                <h2>Risk Per Trade</h2>
+                <p>{{ risk }}</p>
+            </div>
         </div>
 
         <h2>Open Positions ({{ trades|length }})</h2>
@@ -158,43 +162,64 @@
         </div>
 
         <h2>Trade History</h2>
-        <div class="table-container">
-            {% if trade_history %}
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Pair</th>
-                            <th>Direction</th>
-                            <th>Entry</th>
-                            <th>Exit</th>
-                            <th>Status</th>
-                            <th>P/L</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for closed_trade in trade_history %}
-                        <tr>
-                            <td>{{ closed_trade.pair }}</td>
-                            <td>
-                                <span class="{{ 'long' if closed_trade.direction == 'LONG' else 'short' }}">
-                                    {{ closed_trade.direction }}
-                                </span>
-                            </td>
-                            <td>{{ "%.4f"|format(closed_trade.entry_price) }}</td>
-                            <td>{{ "%.4f"|format(closed_trade.exit_price) }}</td>
-                            <td>{{ closed_trade.status }}</td>
-                            <td>
-                                <span class="{{ 'profit' if closed_trade.pnl >= 0 else 'loss' }}">
-                                    ${{ "%.2f"|format(closed_trade.pnl) }}
-                                </span>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            {% else %}
-                <p>No closed trades yet.</p>
+            <div class="table-container">
+                {% if trade_history %}
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Pair</th>
+                                <th>Direction</th>
+                                <th>Entry</th>
+                                <th>Exit</th>
+                                <th>Status</th>
+                                <th>P/L</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for closed_trade in trade_history %}
+                            <tr>
+                                <td>{{ closed_trade.pair }}</td>
+                                <td>
+                                    <span class="{{ 'long' if closed_trade.direction == 'LONG' else 'short' }}">
+                                        {{ closed_trade.direction }}
+                                    </span>
+                                </td>
+                                <td>{{ "%.4f"|format(closed_trade.entry_price) }}</td>
+                                <td>{{ "%.4f"|format(closed_trade.exit_price) }}</td>
+                                <td>{{ closed_trade.status }}</td>
+                                <td>
+                                    <span class="{{ 'profit' if closed_trade.pnl >= 0 else 'loss' }}">
+                                        ${{ "%.2f"|format(closed_trade.pnl) }}
+                                    </span>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <p>No closed trades yet.</p>
+                {% endif %}
+            </div>
+
+            <!-- ADDED: PAGINATION CONTROLS -->
+            {% if total_pages > 1 %}
+            <div class="pagination">
+                <div>
+                    {% if has_prev %}
+                        <a href="{{ url_for('dashboard', page=current_page - 1) }}" class="pagination-button">« Previous</a>
+                    {% endif %}
+                </div>
+                <div class="page-info">
+                    Page {{ current_page }} of {{ total_pages }}
+                </div>
+                <div>
+                    {% if has_next %}
+                        <a href="{{ url_for('dashboard', page=current_page + 1) }}" class="pagination-button">Next »</a>
+                    {% endif %}
+                </div>
+            </div>
             {% endif %}
+            <!-- /ADDED -->
         </div>
 
         <p class="footer">Page automatically refreshes every 10 seconds.</p>

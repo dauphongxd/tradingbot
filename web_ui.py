@@ -1,6 +1,6 @@
 import json
 import os
-from flask import Flask, render_template, redirect, url_for
+from flask import Flask, render_template, redirect, url_for, request
 import ccxt
 import time
 import database as db
@@ -88,54 +88,64 @@ def calculate_pnl(trade, current_price):
 
 @app.route('/')
 def dashboard():
-    """The main dashboard page with more robust price fetching."""
-    # This ensures the DB file and tables are created on first run.
+    """The main dashboard page with pagination for trade history."""
     db.init_db()
 
+    # --- Settings and Open Trades (No change here) ---
     balance = float(db.get_setting("balance"))
     leverage = float(db.get_setting("leverage"))
+    risk = db.get_setting("risk_per_trade")
     open_trades_objects = db.get_open_trades()
-    trade_history = db.get_trade_history()
     open_trades_data = [asdict(trade) for trade in open_trades_objects]
-    stats = calculate_stats(trade_history)
+    stats = calculate_stats(db.get_trade_history()) # Calculate stats on ALL history
 
     total_floating_pnl = 0.0
     processed_trades = []
-
     for trade in open_trades_data:
         try:
-            # --- NEW: Fetch ticker for each trade individually ---
             ticker = safe_sync_exchange_call(exchange.fetch_ticker, trade['pair'])
-
-            # If the ticker is None after retries, we show N/A
             if not ticker:
                 raise ccxt.NetworkError("Failed to fetch price after retries.")
-
             current_price = ticker['last']
             pnl = calculate_pnl(trade, current_price)
-
             trade['current_pnl'] = pnl
             trade['current_price'] = current_price
             total_floating_pnl += pnl
-
         except Exception as e:
-            # If one ticker fails, it won't stop the others from loading.
             print(f"Could not fetch live price for {trade['pair']}: {e}")
             trade['current_pnl'] = "N/A"
             trade['current_price'] = "N/A"
-
         processed_trades.append(trade)
 
     equity = balance + total_floating_pnl
 
+    # --- NEW: PAGINATION LOGIC FOR TRADE HISTORY ---
+    TRADES_PER_PAGE = 5
+    page = request.args.get('page', 1, type=int)
+    all_trade_history = db.get_trade_history()
+
+    total_trades = len(all_trade_history)
+    total_pages = (total_trades + TRADES_PER_PAGE - 1) // TRADES_PER_PAGE
+
+    start_index = (page - 1) * TRADES_PER_PAGE
+    end_index = start_index + TRADES_PER_PAGE
+    paginated_history = all_trade_history[start_index:end_index]
+    # --- END OF NEW LOGIC ---
+
     return render_template('index.html',
                            balance=balance,
                            leverage=leverage,
+                           risk=risk,
                            trades=processed_trades,
                            floating_pnl=total_floating_pnl,
                            equity=equity,
                            stats=stats,
-                           trade_history=trade_history)  # Already sorted newest first
+                           trade_history=paginated_history,  # Use the paginated list
+                           # --- Pass pagination variables to the template ---
+                           current_page=page,
+                           total_pages=total_pages,
+                           has_prev=(page > 1),
+                           has_next=(page < total_pages))
 
 
 @app.route('/close_trade/<trade_id>')

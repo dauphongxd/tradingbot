@@ -4,3 +4,6 @@ labels/
 "price detection.v1i.yolov8/"
 .env
 trading_monitor_session.session
+trading_bot.db
+trading_bot_testnet.db
+trading_monitor_session.session-journal
