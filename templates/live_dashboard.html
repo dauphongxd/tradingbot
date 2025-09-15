@@ -31,6 +31,10 @@
                 <h2>Risk Per Trade</h2>
                 <p>{{ risk }}</p>
             </div>
+            <div class="card">
+                <h2>Leverage</h2>
+                <p>{{ leverage|float }}x</p>
+            </div>
         </div>
 
         <!-- Section 1: Your Active Positions -->
@@ -85,41 +89,105 @@
         </div>
 
         <!-- Section 2: Your Pending SL and TP Orders -->
-        <h2>Open Orders ({{ open_orders|length }})</h2>
-        <div class="table-container">
-            {% if open_orders %}
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Pair</th>
-                            <th>Type</th>
-                            <th>Side</th>
-                            <th>Amount</th>
-                            <th>Trigger Price</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for order in open_orders %}
-                        <tr>
-                            <td>{{ order.symbol }}</td>
-                            <td>{{ order.type|replace('_', ' ')|upper }}</td>
-                            <td>
-                                <span class="{{ 'long' if order.side == 'buy' else 'short' }}">
-                                    {{ order.side|upper }}
+        <h2>Open Orders</h2>
+            <div class="order-groups-container">
+                {% if grouped_orders %}
+                    {% for symbol, orders in grouped_orders.items() %}
+                        <div class="order-group">
+                            <div class="order-group-header" onclick="toggleDetails('{{ symbol }}-details')">
+                                <span class="symbol-name">{{ symbol }}</span>
+                                <span class="order-summary">
+                                    {% if orders.stop_loss %}1 SL{% endif %}
+                                    {% if orders.stop_loss and orders.take_profits %}, {% endif %}
+                                    {% if orders.take_profits %}{{ orders.take_profits|length }} TPs{% endif %}
                                 </span>
-                            </td>
-                            <td>{{ order.amount|float }}</td>
-                            <td>{{ "%.4f"|format(order.price|float) }}</td>
-                            <td>{{ order.status|capitalize }}</td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            {% else %}
-                <p>No pending Stop Loss or Take Profit orders.</p>
-            {% endif %}
-        </div>
+                                <span class="expand-indicator">▼</span>
+                            </div>
+                            <div class="order-group-details" id="{{ symbol }}-details" style="display: none;">
+                                <!-- Stop Loss Section -->
+                                {% if orders.stop_loss %}
+                                <div class="sub-group">
+                                    <div class="sub-group-header">
+                                        <h4>Stop Loss</h4>
+                                    </div>
+                                    <div class="table-container-nested">
+                                        <table>
+                                            <thead>
+                                                <tr>
+                                                    <th>Type</th>
+                                                    <th>Side</th>
+                                                    <th>Amount</th>
+                                                    <th>Trigger Price</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <tr>
+                                                    <td>{{ orders.stop_loss.type|replace('_', ' ')|upper }}</td>
+                                                    <td><span class="{{ 'short' if orders.stop_loss.side == 'sell' else 'long' }}">{{ orders.stop_loss.side|upper }}</span></td>
+                                                    <td>{{ orders.stop_loss.amount|float }}</td>
+                                                    <td>{{ "%.4f"|format(orders.stop_loss.stopPrice|float) }}</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                                {% endif %}
+
+                                <!-- Take Profit Section -->
+                                {% if orders.take_profits %}
+                                <div class="sub-group">
+                                    <div class="sub-group-header expandable" onclick="toggleDetails('{{ symbol }}-tps')">
+                                        <h4>Take Profits ({{ orders.take_profits|length }})</h4>
+                                        <span class="expand-indicator-small">▼</span>
+                                    </div>
+                                    <div class="table-container-nested" id="{{ symbol }}-tps" style="display: none;">
+                                        <table>
+                                            <thead>
+                                                <tr>
+                                                    <th>Side</th>
+                                                    <th>Amount</th>
+                                                    <th>Price</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {% for tp in orders.take_profits %}
+                                                <tr>
+                                                    <td><span class="{{ 'short' if tp.side == 'sell' else 'long' }}">{{ tp.side|upper }}</span></td>
+                                                    <td>{{ tp.amount|float }}</td>
+                                                    <td>{{ "%.4f"|format(tp.price|float) }}</td>
+                                                </tr>
+                                                {% endfor %}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                                {% endif %}
+                            </div>
+                        </div>
+                    {% endfor %}
+                {% else %}
+                    <p>No pending Stop Loss or Take Profit orders.</p>
+                {% endif %}
+            </div>
+
+            <!-- Add Javascript at the end of the body -->
+            <script>
+                function toggleDetails(elementId) {
+                    const element = document.getElementById(elementId);
+                    const parentHeader = element.previousElementSibling;
+                    const indicator = parentHeader.querySelector('.expand-indicator, .expand-indicator-small');
+
+                    if (element.style.display === 'none') {
+                        element.style.display = 'block';
+                        if (indicator) indicator.style.transform = 'rotate(180deg)';
+                    } else {
+                        element.style.display = 'none';
+                        if (indicator) indicator.style.transform = 'rotate(0deg)';
+                    }
+                    // Stop the click from bubbling up to the parent collapsible element
+                    event.stopPropagation();
+                }
+            </script>
 
         <p class="footer">Page automatically refreshes every 15 seconds. Data is from Binance Testnet.</p>
     </div>

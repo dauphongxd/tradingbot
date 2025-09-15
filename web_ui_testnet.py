@@ -62,20 +62,45 @@ def dashboard():
         # --- Process Data ---
         balance = balance_data['USDT']['total']
         risk = db.get_setting("risk_per_trade")
+        leverage = db.get_setting("leverage")
 
         open_positions = [p for p in positions_data if float(p['contracts']) != 0]
         total_floating_pnl = sum(float(p.get('unrealizedPnl', 0)) for p in open_positions)
         equity = balance + total_floating_pnl
 
+        # --- NEW: Group Open Orders by Symbol ---
+        grouped_orders = {}
+        for order in open_orders_data:
+            symbol = order['symbol']
+            if symbol not in grouped_orders:
+                # Initialize the structure for this symbol
+                grouped_orders[symbol] = {
+                    'stop_loss': None,
+                    'take_profits': []
+                }
+
+            # Check if it's a Stop Loss or Take Profit order and place it
+            if order['type'] == 'stop_market':
+                grouped_orders[symbol]['stop_loss'] = order
+            elif order['type'] == 'limit':  # Assuming all limit orders are TPs
+                grouped_orders[symbol]['take_profits'].append(order)
+
+        # Sort TPs by price for logical display (highest price for shorts, lowest for longs)
+        for symbol, orders in grouped_orders.items():
+            is_short = orders['take_profits'] and orders['take_profits'][0]['side'] == 'sell'
+            orders['take_profits'].sort(key=lambda x: x['price'], reverse=is_short)
+        # --- END NEW LOGIC ---
+
         # --- Pass to Template ---
-        return render_template('live_dashboard.html',  # Use a dedicated template
+        return render_template('live_dashboard.html',
                                balance=balance,
                                risk=risk,
                                equity=equity,
                                floating_pnl=total_floating_pnl,
-                               open_positions=open_positions,  # <-- Pass open positions
-                               open_orders=open_orders_data,  # <-- Pass open orders
-                               trade_history=[])  # <-- History would need pagination and is a separate task
+                               open_positions=open_positions,
+                               grouped_orders=grouped_orders,  # <-- Pass the new grouped data
+                               trade_history=[],
+                               leverage=leverage)
 
     except Exception as e:
         print(f"Error loading dashboard: {e}")

@@ -135,3 +135,78 @@ td.current-price {
     color: #aaa;
     font-weight: bold;
 }
+
+.order-groups-container {
+    display: flex;
+    flex-direction: column;
+    gap: 15px; /* Space between each symbol group */
+}
+
+.order-group {
+    background-color: #2c2c2e;
+    border-radius: 8px;
+    border: 1px solid #444;
+    overflow: hidden; /* Ensures child elements conform to border radius */
+}
+
+.order-group-header {
+    padding: 15px 20px;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background-color: #3a3a3c;
+    transition: background-color 0.2s ease;
+}
+
+.order-group-header:hover {
+    background-color: #4a4a4c;
+}
+
+.order-group-header .symbol-name {
+    font-size: 1.2em;
+    font-weight: bold;
+    color: #f2f2f7;
+}
+
+.order-group-header .order-summary {
+    font-size: 0.9em;
+    color: #a0a0a5;
+}
+
+.expand-indicator, .expand-indicator-small {
+    transition: transform 0.3s ease;
+    font-size: 1em;
+}
+
+.order-group-details {
+    padding: 0 20px 20px 20px; /* Padding for the inner content */
+    background-color: #2c2c2e;
+}
+
+.sub-group {
+    margin-top: 15px;
+}
+
+.sub-group-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #444;
+    padding-bottom: 8px;
+    margin-bottom: 10px;
+}
+
+.sub-group-header.expandable {
+    cursor: pointer;
+}
+
+.sub-group-header h4 {
+    margin: 0;
+    font-weight: 500;
+    color: #ccc;
+}
+
+.table-container-nested {
+    padding-left: 15px; /* Indent the nested tables */
+}
