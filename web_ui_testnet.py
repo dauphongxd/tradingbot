@@ -54,42 +54,56 @@ def dashboard():
     """The live dashboard, now showing positions, open orders, and history."""
     try:
         # --- Fetch All Live Data ---
-        balance_data = safe_sync_exchange_call(exchange.fetch_balance) or {}  # Default to empty dict
-        positions_data = safe_sync_exchange_call(exchange.fetch_positions) or []  # Default to empty list
-        open_orders_data = safe_sync_exchange_call(exchange.fetch_open_orders) or []  # Default to empty list
-        # Note: Fetching full history for stats is slow. We will omit for now.
+        balance_data = safe_sync_exchange_call(exchange.fetch_balance) or {}
+        positions_data = safe_sync_exchange_call(exchange.fetch_positions) or []
 
-        # --- Process Data ---
-        balance = balance_data['USDT']['total']
+        # --- START OF FIX ---
+        # We cannot fetch all open orders at once.
+        # Instead, we get symbols from open positions and fetch orders for each one.
+        open_positions = [p for p in positions_data if float(p.get('contracts', 0)) != 0]
+
+        all_open_orders = []
+        if open_positions:
+            # Get a unique list of symbols that have an open position
+            symbols_with_positions = list(set([p['symbol'] for p in open_positions]))
+
+            # Loop through each symbol to get its open orders
+            for symbol in symbols_with_positions:
+                orders_for_symbol = safe_sync_exchange_call(exchange.fetch_open_orders, symbol)
+                if orders_for_symbol:
+                    all_open_orders.extend(orders_for_symbol)
+        # --- END OF FIX ---
+
+        # --- Process Data (using the corrected data) ---
+        balance = balance_data.get('USDT', {}).get('total', INITIAL_BALANCE)
         risk = db.get_setting("risk_per_trade")
         leverage = db.get_setting("leverage")
 
-        open_positions = [p for p in positions_data if float(p['contracts']) != 0]
         total_floating_pnl = sum(float(p.get('unrealizedPnl', 0)) for p in open_positions)
         equity = balance + total_floating_pnl
 
-        # --- NEW: Group Open Orders by Symbol ---
+        # --- Group Open Orders by Symbol (using all_open_orders) ---
         grouped_orders = {}
-        for order in open_orders_data:
+        for order in all_open_orders:  # <-- Use the new aggregated list
             symbol = order['symbol']
             if symbol not in grouped_orders:
-                # Initialize the structure for this symbol
                 grouped_orders[symbol] = {
                     'stop_loss': None,
                     'take_profits': []
                 }
 
-            # Check if it's a Stop Loss or Take Profit order and place it
             if order['type'] == 'stop_market':
                 grouped_orders[symbol]['stop_loss'] = order
-            elif order['type'] == 'limit':  # Assuming all limit orders are TPs
+            elif order['type'] in ['limit', 'take_profit_market']:
                 grouped_orders[symbol]['take_profits'].append(order)
 
-        # Sort TPs by price for logical display (highest price for shorts, lowest for longs)
+        # Sort TPs by price for logical display
         for symbol, orders in grouped_orders.items():
-            is_short = orders['take_profits'] and orders['take_profits'][0]['side'] == 'sell'
-            orders['take_profits'].sort(key=lambda x: x['price'], reverse=is_short)
-        # --- END NEW LOGIC ---
+            # Find the corresponding position to determine if it's long or short
+            position_for_symbol = next((p for p in open_positions if p['symbol'] == symbol), None)
+            if position_for_symbol:
+                is_short = position_for_symbol['side'] == 'short'
+                orders['take_profits'].sort(key=lambda x: x['price'], reverse=is_short)
 
         # --- Pass to Template ---
         return render_template('live_dashboard.html',
@@ -98,12 +112,15 @@ def dashboard():
                                equity=equity,
                                floating_pnl=total_floating_pnl,
                                open_positions=open_positions,
-                               grouped_orders=grouped_orders,  # <-- Pass the new grouped data
+                               grouped_orders=grouped_orders,
                                trade_history=[],
                                leverage=leverage)
 
     except Exception as e:
+        # This will now print the true error if something else goes wrong
         print(f"Error loading dashboard: {e}")
+        import traceback
+        traceback.print_exc()  # Print the full error traceback to the console
         return f"<h1>Error connecting to Binance Testnet</h1><p>{e}</p>"
 
 
