@@ -345,8 +345,27 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
         await exchange.load_markets()
         market = exchange.market(trading_pair)
 
+        # --- START OF FIX ---
+        # This block now properly handles leverage errors and stops execution if it fails.
         leverage = int(float(db.get_setting('leverage')))
-        await safe_exchange_call(exchange.set_leverage, leverage, trading_pair)
+        try:
+            await exchange.set_leverage(leverage, trading_pair)
+        except ccxt.BadRequest as e:
+            logger.error(f"Failed to set leverage for {trading_pair}. Exchange error: {e}")
+            await context.bot.send_message(
+                chat_id=int(AUTHORIZED_USER_ID),
+                text=f"{BOT_MODE_TAG}❌ **Leverage Error for {trading_pair}**\n\n"
+                     f"The exchange rejected the leverage setting ({leverage}x). The symbol may not support this leverage or may not be a valid futures pair on the testnet.\n\n"
+                     f"`{e}`"
+            )
+            return  # IMPORTANT: Stop execution here
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while setting leverage for {trading_pair}: {e}", exc_info=True)
+            await context.bot.send_message(
+                chat_id=int(AUTHORIZED_USER_ID),
+                text=f"{BOT_MODE_TAG}🚨 An unexpected error occurred while setting leverage for {trading_pair}."
+            )
+            return  # IMPORTANT: Stop execution here
 
         balance_data = await safe_exchange_call(exchange.fetch_balance)
         balance = balance_data['USDT']['total']
@@ -614,17 +633,44 @@ async def live_trade_monitor(application: Application):
                                              position_size_str, None, {'stopPrice': sl_price})
 
                     tp_side = 'sell' if is_long else 'buy'
-                    ideal_partial_size = float(position_size_str) / 10
-                    partial_size_str = exchange.amount_to_precision(exchange_symbol, ideal_partial_size)
+                    total_position_size = float(position_size_str)
+                    num_partials = 10
+                    # Ensure partial size calculation is not zero
+                    if total_position_size / num_partials < float(market['limits']['amount']['min']):
+                        num_partials = 1  # Not enough size for partials, create one full TP
+
+                    # Calculate size for each partial TP
+                    partial_size = total_position_size / num_partials
+                    partial_size_str = exchange.amount_to_precision(exchange_symbol, partial_size)
+                    total_placed_size = 0.0
 
                     if float(partial_size_str) > 0:
-                        step_size = (stop_loss_distance * 10.0) / 10
-                        for i in range(1, 11):
+                        step_size = stop_loss_distance  # Simplified from (stop_loss_distance * 10.0) / 10
+
+                        # Place the first N-1 partial TPs
+                        for i in range(1, num_partials):
                             tp_price = actual_entry_price + (step_size * i) if is_long else actual_entry_price - (
                                         step_size * i)
                             tp_price_formatted = exchange.price_to_precision(exchange_symbol, tp_price)
+
                             await safe_exchange_call(exchange.create_order, exchange_symbol, 'limit', tp_side,
                                                      partial_size_str, tp_price_formatted, {'reduceOnly': True})
+                            total_placed_size += float(partial_size_str)
+
+                        # Calculate remaining size for the last TP to avoid rounding errors
+                        remaining_size = total_position_size - total_placed_size
+                        last_partial_size_str = exchange.amount_to_precision(exchange_symbol, remaining_size)
+
+                        if float(last_partial_size_str) > 0:
+                            # Place the final TP with the exact remaining size
+                            last_tp_price = actual_entry_price + (
+                                        step_size * num_partials) if is_long else actual_entry_price - (
+                                        step_size * num_partials)
+                            last_tp_price_formatted = exchange.price_to_precision(exchange_symbol, last_tp_price)
+
+                            await safe_exchange_call(exchange.create_order, exchange_symbol, 'limit', tp_side,
+                                                     last_partial_size_str, last_tp_price_formatted,
+                                                     {'reduceOnly': True})
 
                     logger.info(f"Successfully placed SL and TP orders for {bot_symbol}.")
 
