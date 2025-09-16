@@ -113,15 +113,25 @@ def close_trade(symbol):
     trading_pair = symbol
     print(f"Received UI request to close {trading_pair}")
     try:
-        # Fetch the specific position to get its details
-        positions = safe_sync_exchange_call(exchange.fetch_positions, [trading_pair])
-        target_position = positions[0] if positions and float(positions[0]['contracts']) != 0 else None
+        # --- START OF FIX ---
+        # Instead of fetching a single position, fetch ALL positions and then filter.
+        # This is more robust and avoids the 'list' object TypeError.
+
+        all_positions = safe_sync_exchange_call(exchange.fetch_positions) or []
+        target_position = None
+        for position in all_positions:
+            # Find the position that matches the symbol AND has a non-zero size
+            if position['symbol'] == trading_pair and float(position.get('contracts', 0)) != 0:
+                target_position = position
+                break # Found it, so we can stop looping
+
+        # --- END OF FIX ---
 
         if not target_position:
-            print(f"Could not find open position for {trading_pair} to close.")
+            print(f"Could not find an open position for {trading_pair} to close.")
             return redirect(url_for('dashboard'))
 
-        # Determine side and size
+        # Determine side and size from the filtered position
         position_size = float(target_position['contracts'])
         side_to_close = 'sell' if target_position['side'] == 'long' else 'buy'
 
