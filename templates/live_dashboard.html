@@ -14,8 +14,8 @@
         <!-- The summary grid is simplified because live stats are slow to calculate -->
         <div class="summary-grid">
             <div class="card">
-                <h2>Balance</h2>
-                <p>${{ "%.2f"|format(balance|float) }}</p>
+                <h2>Wallet Balance</h2>
+                <p>${{ "%.2f"|format(wallet_balance|float) }}</p>
             </div>
             <div class="card">
                 <h2>Floating P/L</h2>
@@ -24,16 +24,20 @@
                 </p>
             </div>
             <div class="card">
-                <h2>Equity</h2>
+                <h2>Equity (Live Value)</h2>
                 <p>${{ "%.2f"|format(equity|float) }}</p>
             </div>
-            <div class="card">
-                <h2>Risk Per Trade</h2>
-                <p>{{ risk }}</p>
+             <div class="card">
+                <h2>Maint. Margin (Risk)</h2>
+                <p>${{ "%.2f"|format(maintenance_margin|float) }}</p>
             </div>
             <div class="card">
                 <h2>Leverage</h2>
                 <p>{{ leverage|float }}x</p>
+            </div>
+            <div class="card">
+                <h2>Risk Per Trade</h2>
+                <p>{{ risk }}</p>
             </div>
         </div>
 
@@ -51,6 +55,7 @@
                             <th>Mark Price</th>
                             <th>Liq. Price</th>
                             <th>Unrealized PNL</th>
+                            <th>Peak P/L</th>
                             <th>Actions</th>
                         </tr>
                     </thead>
@@ -73,7 +78,12 @@
                                 </span>
                             </td>
                             <td>
-                                <a href="{{ url_for('close_trade', symbol=position.symbol) }}"
+                                <span class="{{ 'profit' if position.highest_pnl|float >= 0 else 'loss' }}">
+                                    ${{ "%.2f"|format(position.highest_pnl|float) }}
+                                </span>
+                            </td>
+                            <td>
+                                <a href="{{ url_for('close_trade', symbol=position.symbol|replace('/', '')) }}"
                                    class="close-button"
                                    onclick="return confirm('Are you sure you want to close the {{position.symbol}} position on the exchange?');">
                                    &times;

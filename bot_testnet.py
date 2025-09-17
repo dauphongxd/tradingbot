@@ -71,7 +71,8 @@ app_state = {
     "balance": 0.0,
     "leverage": 0.0,
     "pending_confirmations": {},
-    "pending_sl_tp_placement": {} # <-- ADD THIS to store details
+    "pending_sl_tp_placement": {},
+    "unfilled_entry_orders": {}
 }
 
 # --- START: TESTNET CONFIGURATION ---
@@ -389,10 +390,19 @@ async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trad
         # --- THIS IS THE FIX ---
         # If the order placement failed (e.g., invalid symbol), entry_order will be None.
         if not entry_order:
-            logger.error(f"Failed to place limit entry order for {trading_pair}. The symbol may be invalid on the testnet.")
-            await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID), text=f"{BOT_MODE_TAG}❌ **Order Failed for {trading_pair}**\n\nThe exchange rejected the order. This symbol may not be available on the testnet.")
-            return # Stop execution here
+            logger.error(
+                f"Failed to place limit entry order for {trading_pair}. The symbol may be invalid on the testnet.")
+            await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
+                                           text=f"{BOT_MODE_TAG}❌ **Order Failed for {trading_pair}**\n\nThe exchange rejected the order. This symbol may not be available on the testnet.")
+            return
         # --- END FIX ---
+
+        order_id = entry_order['id']
+        app_state["unfilled_entry_orders"][order_id] = {
+            "symbol": trading_pair,
+            "timestamp": entry_order['timestamp']  # The creation time in milliseconds
+        }
+        logger.info(f"Began tracking order {order_id} for TTL.")
 
         # 3. Stage the SL/TP details in memory, waiting for the fill
         app_state["pending_sl_tp_placement"][trading_pair] = {
@@ -607,9 +617,50 @@ async def live_trade_monitor(application: Application):
 
     while True:
         try:
+            TTL_MS = 24 * 60 * 60 * 1000  # 24 hours in milliseconds
+            if app_state["unfilled_entry_orders"]:  # Only run if there's something to check
+                # We iterate over a copy of the items because we may delete from the dict
+                for order_id, order_data in list(app_state["unfilled_entry_orders"].items()):
+                    current_timestamp = exchange.milliseconds()
+                    if current_timestamp - order_data['timestamp'] > TTL_MS:
+                        try:
+                            logger.warning(
+                                f"Order {order_id} for {order_data['symbol']} has expired. Attempting to cancel.")
+
+                            # Attempt to cancel the order on the exchange
+                            await safe_exchange_call(exchange.cancel_order, order_id, order_data['symbol'])
+
+                            logger.info(f"Successfully cancelled expired order {order_id}.")
+
+                            # Send a notification to Telegram
+                            await application.bot.send_message(
+                                chat_id=int(AUTHORIZED_USER_ID),
+                                text=f"{BOT_MODE_TAG}⏰ **Order Expired** ⏰\n\n"
+                                     f"The limit entry order for **{order_data['symbol']}** was not filled within 24 hours and has been automatically cancelled.",
+                                parse_mode='Markdown'
+                            )
+
+                        except Exception as e:
+                            logger.error(
+                                f"Could not cancel expired order {order_id}. It may have been filled or already cancelled. Error: {e}")
+
+                        # IMPORTANT: Always remove the order from tracking, regardless of success
+                        del app_state["unfilled_entry_orders"][order_id]
+
+
             # Get all current data from the exchange
             current_positions_list = await safe_exchange_call(exchange.fetch_positions)
             current_positions = {p['symbol']: p for p in current_positions_list if float(p['contracts']) != 0}
+            high_water_marks = db.get_high_water_marks()
+            for symbol, position in current_positions.items():
+                current_pnl = float(position.get('unrealizedPnl', 0))
+
+                # Get the stored peak PNL, defaulting to the current PNL if it's a new trade
+                stored_peak_pnl = high_water_marks.get(symbol, current_pnl)
+
+                if current_pnl > stored_peak_pnl:
+                    logger.info(f"New peak P/L for {symbol}: ${current_pnl:.2f}")
+                    db.update_high_water_mark(symbol, current_pnl)
             pending_placements = app_state.get("pending_sl_tp_placement", {})
 
             # --- SINGLE, ROBUST LOOP TO PROCESS ALL CURRENT POSITIONS ---
@@ -621,6 +672,13 @@ async def live_trade_monitor(application: Application):
                     logger.info(f"Detected filled entry for {bot_symbol}. Placing SL/TP orders.")
 
                     details = pending_placements[bot_symbol]
+
+                    # --- FIX: Load market data for the current symbol ---
+                    market = await safe_exchange_call(exchange.market, exchange_symbol)
+                    if not market:
+                        logger.error(f"Could not load market data for {exchange_symbol}, skipping SL/TP placement.")
+                        continue  # Skip to the next position
+
                     sl_price = details["sl_price"]
                     position_size_str = details["position_size_str"]
                     is_long = details["is_long"]
@@ -685,13 +743,24 @@ async def live_trade_monitor(application: Application):
 
                     # Mark as managed: add to watched_positions and remove from pending
                     watched_positions[exchange_symbol] = position
+                    position['highest_pnl'] = float(position.get('unrealizedPnl', 0))  # Initialize with current PnL
                     del app_state["pending_sl_tp_placement"][bot_symbol]
+
+                    filled_order_id = None
+                    for order_id, data in list(app_state["unfilled_entry_orders"].items()):
+                        if data['symbol'] == exchange_symbol:
+                            filled_order_id = order_id
+                            break
+                    if filled_order_id:
+                        del app_state["unfilled_entry_orders"][filled_order_id]
+                        logger.info(f"Stopped tracking filled order {filled_order_id} for TTL.")
 
                 # Priority 2: Is this a position we don't know about? (from a previous session)
                 elif exchange_symbol not in watched_positions:
                     logger.info(
                         f"Detected existing position for {bot_symbol} from a previous session. Adding to watch list.")
                     watched_positions[exchange_symbol] = position
+                    position['highest_pnl'] = float(position.get('unrealizedPnl', 0))  # Initialize with current PnL
 
             # --- CHECK FOR CLOSED POSITIONS ---
             # Create a copy of keys to safely iterate while deleting
@@ -719,6 +788,8 @@ async def live_trade_monitor(application: Application):
                     await application.bot.send_message(chat_id=int(AUTHORIZED_USER_ID), text=message,
                                                        parse_mode='Markdown')
 
+                    db.delete_high_water_mark(exchange_symbol)
+                    logger.info(f"Cleaned up high-water mark for closed position {exchange_symbol}.")
                     # Clean up the watch list
                     del watched_positions[exchange_symbol]
 

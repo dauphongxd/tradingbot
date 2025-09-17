@@ -100,6 +100,11 @@ SCHEMA = """
              DEFAULT \
              CURRENT_TIMESTAMP
          ); \
+         -- NEW TABLE FOR LIVE BOT'S PEAK P/L --
+         CREATE TABLE IF NOT EXISTS high_water_marks (
+            symbol TEXT PRIMARY KEY,
+            highest_pnl REAL NOT NULL DEFAULT 0.0
+         );
          """
 
 
@@ -110,29 +115,80 @@ def get_db_connection():
     return conn
 
 
-def init_db(initial_balance=1000.0, initial_leverage=20.0, initial_risk=50.0): # <-- Add initial_risk
-    """Initializes the database tables and default settings."""
+def migrate_database():
+    """
+    Safely adds new columns and tables to an existing database without deleting data.
+    This is safe to run every time the application starts.
+    """
+    print("Checking database schema for required migrations...")
     with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # --- Migration 1: Add 'highest_pnl' to 'open_trades' for the paper bot ---
+        cursor.execute("PRAGMA table_info(open_trades)")
+        columns = [row['name'] for row in cursor.fetchall()]
+
+        if 'highest_pnl' not in columns:
+            print("Applying migration: Adding 'highest_pnl' column to 'open_trades' table...")
+            cursor.execute("ALTER TABLE open_trades ADD COLUMN highest_pnl REAL NOT NULL DEFAULT 0.0")
+            print("Migration successful.")
+        else:
+            print("'highest_pnl' column already exists in 'open_trades'. No changes needed.")
+
+        cursor.execute("PRAGMA table_info(open_trades)")
+        columns = [row['name'] for row in cursor.fetchall()]
+        if 'cumulative_pnl' not in columns:
+            print("Applying migration: Adding 'cumulative_pnl' column to 'open_trades' table...")
+            cursor.execute("ALTER TABLE open_trades ADD COLUMN cumulative_pnl REAL NOT NULL DEFAULT 0.0")
+            print("Migration successful.")
+        else:
+            print("'cumulative_pnl' column already exists in 'open_trades'. No changes needed.")
+
+        # --- Migration 2: Add 'high_water_marks' table for the live testnet bot ---
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='high_water_marks'")
+        table_exists = cursor.fetchone()
+
+        if not table_exists:
+            print("Applying migration: Creating 'high_water_marks' table...")
+            cursor.execute("""
+                           CREATE TABLE high_water_marks
+                           (
+                               symbol      TEXT PRIMARY KEY,
+                               highest_pnl REAL NOT NULL DEFAULT 0.0
+                           )
+                           """)
+            print("Migration successful.")
+        else:
+            print("'high_water_marks' table already exists. No changes needed.")
+
+        conn.commit()
+
+
+def init_db(initial_balance=1000.0, initial_leverage=20.0, initial_risk=50.0):
+    """Initializes the database, creates tables if they don't exist, and runs migrations."""
+    with get_db_connection() as conn:
+        # This part creates the tables only if they don't exist at all
         conn.executescript(SCHEMA)
-        # Set default balance only if it doesn't exist
+
+    # Run the migration to add new columns/tables to the existing structure
+    migrate_database()
+
+    with get_db_connection() as conn:
+        # This part sets default settings only if they don't exist
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             ("balance", str(initial_balance))
         )
-        # Set default leverage only if it doesn't exist
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             ("leverage", str(initial_leverage))
         )
-        # --- ADD THIS BLOCK ---
-        # Set default risk per trade only if it doesn't exist
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             ("risk_per_trade", str(initial_risk))
         )
-        # --- END ADDITION ---
         conn.commit()
-    print("Database initialized successfully.")
+    print("Database initialization and migration check complete.")
 
 
 def get_setting(key):
@@ -155,15 +211,14 @@ def update_setting(key, value):
 def add_trade(trade: PaperTrade):
     """Adds a new open trade to the database."""
     trade_dict = asdict(trade)
-    # SQLite doesn't have a list/dict type, so we store tp_levels as a JSON string
     trade_dict['tp_levels'] = json.dumps(trade_dict['tp_levels'])
 
     with get_db_connection() as conn:
         conn.execute(
             """INSERT INTO open_trades (trade_id, pair, entry_price, sl_price, initial_size, remaining_size, leverage,
-                                        is_long, tp_levels, sl_moved_to_be)
+                                        is_long, tp_levels, sl_moved_to_be, highest_pnl, cumulative_pnl)
                VALUES (:trade_id, :pair, :entry_price, :sl_price, :initial_size, :remaining_size, :leverage, :is_long,
-                       :tp_levels, :sl_moved_to_be)""",
+                       :tp_levels, :sl_moved_to_be, :highest_pnl, :cumulative_pnl)""", # <-- Add :cumulative_pnl
             trade_dict
         )
         conn.commit()
@@ -177,9 +232,12 @@ def update_trade(trade: PaperTrade):
                SET sl_price       = ?,
                    remaining_size = ?,
                    tp_levels      = ?,
-                   sl_moved_to_be = ?
+                   sl_moved_to_be = ?,
+                   highest_pnl    = ?,
+                   cumulative_pnl = ?   -- <-- ADD THIS LINE
                WHERE trade_id = ?""",
-            (trade.sl_price, trade.remaining_size, json.dumps(trade.tp_levels), trade.sl_moved_to_be, trade.trade_id)
+            (trade.sl_price, trade.remaining_size, json.dumps(trade.tp_levels), trade.sl_moved_to_be,
+             trade.highest_pnl, trade.cumulative_pnl, trade.trade_id) # <-- Add trade.cumulative_pnl
         )
         conn.commit()
 
@@ -242,3 +300,27 @@ def get_trade_history():
         rows = conn.execute("SELECT * FROM trade_history ORDER BY close_timestamp DESC").fetchall()
         # Return as a list of dictionaries for easy use in the web UI
         return [dict(row) for row in rows]
+
+def update_high_water_mark(symbol: str, pnl: float):
+    """Inserts or updates the highest PNL for a given symbol."""
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO high_water_marks (symbol, highest_pnl) VALUES (?, ?)",
+            (symbol, pnl)
+        )
+        conn.commit()
+
+def get_high_water_marks():
+    """Retrieves all high-water marks as a dictionary for easy lookup."""
+    marks = {}
+    with get_db_connection() as conn:
+        rows = conn.execute("SELECT symbol, highest_pnl FROM high_water_marks").fetchall()
+        for row in rows:
+            marks[row['symbol']] = row['highest_pnl']
+    return marks
+
+def delete_high_water_mark(symbol: str):
+    """Removes a high-water mark record when a trade is closed."""
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM high_water_marks WHERE symbol = ?", (symbol,))
+        conn.commit()

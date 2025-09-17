@@ -72,6 +72,7 @@
                             <th>TP Progress</th>
                             <!-- /ADDED -->
                             <th>Current P/L</th>
+                            <th>Peak P/L</th>
                             <th>Current Price</th>
                             <th>Actions</th>
                         </tr>
@@ -133,6 +134,13 @@
                                 {% else %}
                                     {{ trade.current_pnl }}
                                 {% endif %}
+                            </td>
+
+                            <!-- Peak P/L -->
+                            <td>
+                                <span class="{{ 'profit' if trade.highest_pnl|float >= 0 else 'loss' }}">
+                                    ${{ "%.2f"|format(trade.highest_pnl|float) }}
+                                </span>
                             </td>
 
                             <!-- Current Price -->

@@ -73,6 +73,8 @@ class PaperTrade:
     is_long: bool
     tp_levels: list = None  # Will be a list of dicts, e.g., [{'price': 123, 'status': 'pending'}]
     sl_moved_to_be: bool = False
+    highest_pnl: float = 0.0
+    cumulative_pnl: float = 0.0
 
 
 # ==============================================================================
@@ -164,6 +166,18 @@ async def market_monitor(application: Application):
                     continue
                 # --- END OF THE DEFINITIVE FIX ---
 
+                price_diff = current_price - trade.entry_price
+                if not trade.is_long:
+                    price_diff = -price_diff
+                current_pnl = price_diff * trade.remaining_size
+
+                # Compare and update if the current PNL is a new high
+                if current_pnl > trade.highest_pnl:
+                    logger.info(f"New peak P/L for paper trade {trade.pair}: ${current_pnl:.2f}")
+                    trade.highest_pnl = current_pnl
+                    db.update_trade(trade)  # Save the new high to the database
+                # --- END OF NEW LOGIC ---
+
                 # --- 1. Check for STOP LOSS hit ---
                 if (trade.is_long and current_price <= trade.sl_price) or \
                         (not trade.is_long and current_price >= trade.sl_price):
@@ -230,16 +244,22 @@ async def process_partial_tp_closure(application: Application, trade: PaperTrade
 
     pnl = price_diff * size_to_close
 
+
+
     # Update state
     current_balance = float(db.get_setting("balance"))
     new_balance = current_balance + pnl
     db.update_setting("balance", new_balance)
+
     trade.remaining_size -= size_to_close
+    trade.cumulative_pnl += pnl  # <-- ADD THIS LINE to update the running total
     level['status'] = 'hit'
 
     is_fully_closed = (level_index == 9) or trade.remaining_size < 1e-8
     if is_fully_closed:
-        db.close_trade(trade.trade_id, f"TP{level_index + 1}_FULL_CLOSE", level['price'], pnl)
+        # Pass the final cumulative PNL to the history
+        db.close_trade(trade.trade_id, f"TP{level_index + 1}_FULL_CLOSE", level['price'],
+                       trade.cumulative_pnl)  # <-- FIX
     else:
         db.update_trade(trade)
 
@@ -264,30 +284,36 @@ async def process_partial_tp_closure(application: Application, trade: PaperTrade
 
 
 async def process_trade_closure(application: Application, trade: PaperTrade, status: str, exit_price: float):
-    """Handles the logic for a FULL trade closure and records it to history."""
     price_diff = exit_price - trade.entry_price
     if not trade.is_long:
         price_diff = -price_diff
 
-    pnl = price_diff * trade.remaining_size
+    # This is the PNL of the FINAL SEGMENT only
+    final_segment_pnl = price_diff * trade.remaining_size
+
+    # Update the balance with only the PNL from this final part
     current_balance = float(db.get_setting("balance"))
-    new_balance = current_balance + pnl
+    new_balance = current_balance + final_segment_pnl
     db.update_setting("balance", new_balance)
 
-    db.close_trade(trade.trade_id, status, exit_price, pnl)
+    # Add the final part's PNL to the running total to get the grand total
+    total_trade_pnl = trade.cumulative_pnl + final_segment_pnl
+
+    # Save the GRAND TOTAL to the trade history
+    db.close_trade(trade.trade_id, status, exit_price, total_trade_pnl)
 
     result_text = "❌ STOP LOSS ❌\n\n" if "SL_HIT" in status else "🔵 MANUAL CLOSE 🔵\n\n"
     message = (
         f"{result_text}"
         f"Trade Closed: **{trade.pair}**\n"
         f"Exit: `{exit_price}`\n"
-        f"PNL: `${pnl:,.2f}`\n\n"
+        f"Total PNL: `${total_trade_pnl:,.2f}`\n\n" # <-- FIX: Use the correct total
         f"**New Balance: `${new_balance:,.2f}`**"
     )
     await application.bot.send_message(
         chat_id=int(AUTHORIZED_USER_ID), text=message, parse_mode='Markdown'
     )
-    logger.info(f"Trade {trade.trade_id} closed. PNL: {pnl:,.2f}. Recorded to history.")
+    logger.info(f"Trade {trade.trade_id} closed. Total PNL: {total_trade_pnl:,.2f}. Recorded to history.")
 
 
 async def close_trade_by_symbol(symbol: str, application: Application):

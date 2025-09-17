@@ -51,76 +51,83 @@ def safe_sync_exchange_call(func, *args, **kwargs):
 
 @app.route('/')
 def dashboard():
-    """The live dashboard, now showing positions, open orders, and history."""
+    """The live dashboard, now showing precise exchange metrics."""
     try:
         # --- Fetch All Live Data ---
         balance_data = safe_sync_exchange_call(exchange.fetch_balance) or {}
         positions_data = safe_sync_exchange_call(exchange.fetch_positions) or []
-
-        # --- START OF FIX ---
-        # We cannot fetch all open orders at once.
-        # Instead, we get symbols from open positions and fetch orders for each one.
         open_positions = [p for p in positions_data if float(p.get('contracts', 0)) != 0]
 
+        # --- NEW: Enrich position data with DB info ---
+        high_water_marks = db.get_high_water_marks()
+
+        for position in open_positions:
+            # Get the peak PNL from our new table, default to 0.0 if not found
+            position['highest_pnl'] = high_water_marks.get(position['symbol'], 0.0)
+
+        # --- NEW: Extract Precise Metrics Directly from API Response ---
+
+        # 1. Wallet Balance (Your realized cash, doesn't change with P/L)
+        # For Binance Futures, this is the 'total' of your USDT balance.
+        wallet_balance = balance_data.get('USDT', {}).get('total', 0.0)
+
+        # 2. Equity (Also called Margin Balance by Binance)
+        # This is the most accurate value for your account's live worth.
+        # We get it directly from the 'info' object.
+        equity = float(balance_data.get('info', {}).get('totalMarginBalance', 0.0))
+
+        # 3. Floating P/L
+        # We can still calculate this for display purposes.
+        total_floating_pnl = sum(float(p.get('unrealizedPnl', 0)) for p in open_positions)
+
+        # 4. Total Maintenance Margin
+        # This is the "danger threshold". We sum it up from all open positions.
+        total_maintenance_margin = sum(float(p['info'].get('maintMargin', 0)) for p in open_positions)
+
+        # --- Fetch other settings from the database ---
+        risk = db.get_setting("risk_per_trade")
+        leverage = db.get_setting("leverage")
+
+        # --- Fetch Open Orders (Your existing logic is good) ---
         all_open_orders = []
         if open_positions:
-            # Get a unique list of symbols that have an open position
             symbols_with_positions = list(set([p['symbol'] for p in open_positions]))
-
-            # Loop through each symbol to get its open orders
             for symbol in symbols_with_positions:
                 orders_for_symbol = safe_sync_exchange_call(exchange.fetch_open_orders, symbol)
                 if orders_for_symbol:
                     all_open_orders.extend(orders_for_symbol)
-        # --- END OF FIX ---
 
-        # --- Process Data (using the corrected data) ---
-        balance = balance_data.get('USDT', {}).get('total', INITIAL_BALANCE)
-        risk = db.get_setting("risk_per_trade")
-        leverage = db.get_setting("leverage")
-
-        total_floating_pnl = sum(float(p.get('unrealizedPnl', 0)) for p in open_positions)
-        equity = balance + total_floating_pnl
-
-        # --- Group Open Orders by Symbol (using all_open_orders) ---
         grouped_orders = {}
-        for order in all_open_orders:  # <-- Use the new aggregated list
+        for order in all_open_orders:
             symbol = order['symbol']
             if symbol not in grouped_orders:
-                grouped_orders[symbol] = {
-                    'stop_loss': None,
-                    'take_profits': []
-                }
-
+                grouped_orders[symbol] = {'stop_loss': None, 'take_profits': []}
             if order['type'] == 'stop_market':
                 grouped_orders[symbol]['stop_loss'] = order
             elif order['type'] in ['limit', 'take_profit_market']:
                 grouped_orders[symbol]['take_profits'].append(order)
 
-        # Sort TPs by price for logical display
         for symbol, orders in grouped_orders.items():
-            # Find the corresponding position to determine if it's long or short
             position_for_symbol = next((p for p in open_positions if p['symbol'] == symbol), None)
             if position_for_symbol:
                 is_short = position_for_symbol['side'] == 'short'
                 orders['take_profits'].sort(key=lambda x: x['price'], reverse=is_short)
 
-        # --- Pass to Template ---
+        # --- Pass all new and old variables to the Template ---
         return render_template('live_dashboard.html',
-                               balance=balance,
-                               risk=risk,
-                               equity=equity,
+                               wallet_balance=wallet_balance,  # <-- NEW
+                               equity=equity,                  # <-- UPDATED
                                floating_pnl=total_floating_pnl,
+                               maintenance_margin=total_maintenance_margin, # <-- NEW
                                open_positions=open_positions,
                                grouped_orders=grouped_orders,
-                               trade_history=[],
-                               leverage=leverage)
+                               leverage=leverage,
+                               risk=risk)
 
     except Exception as e:
-        # This will now print the true error if something else goes wrong
         print(f"Error loading dashboard: {e}")
         import traceback
-        traceback.print_exc()  # Print the full error traceback to the console
+        traceback.print_exc()
         return f"<h1>Error connecting to Binance Testnet</h1><p>{e}</p>"
 
 
