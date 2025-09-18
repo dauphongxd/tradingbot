@@ -647,9 +647,15 @@ async def live_trade_monitor(application: Application):
                         # IMPORTANT: Always remove the order from tracking, regardless of success
                         del app_state["unfilled_entry_orders"][order_id]
 
-
             # Get all current data from the exchange
             current_positions_list = await safe_exchange_call(exchange.fetch_positions)
+
+            if current_positions_list is None:
+                logger.error(
+                    "Could not fetch positions from the exchange. Check API keys and connection. Skipping this monitoring cycle.")
+                await asyncio.sleep(30)
+                continue
+
             current_positions = {p['symbol']: p for p in current_positions_list if float(p['contracts']) != 0}
             high_water_marks = db.get_high_water_marks()
             for symbol, position in current_positions.items():
@@ -673,11 +679,16 @@ async def live_trade_monitor(application: Application):
 
                     details = pending_placements[bot_symbol]
 
-                    # --- FIX: Load market data for the current symbol ---
-                    market = await safe_exchange_call(exchange.market, exchange_symbol)
-                    if not market:
-                        logger.error(f"Could not load market data for {exchange_symbol}, skipping SL/TP placement.")
+                    # --- START OF FIX ---
+                    # The exchange.market() method is synchronous and retrieves data from the already loaded cache.
+                    # It should NOT be awaited or wrapped in safe_exchange_call.
+                    try:
+                        market = exchange.market(exchange_symbol)
+                    except ccxt.BadSymbol:
+                        logger.error(
+                            f"Could not find market data for {exchange_symbol} in the loaded markets cache. Skipping SL/TP placement.")
                         continue  # Skip to the next position
+                    # --- END OF FIX ---
 
                     sl_price = details["sl_price"]
                     position_size_str = details["position_size_str"]
@@ -708,7 +719,7 @@ async def live_trade_monitor(application: Application):
                         # Place the first N-1 partial TPs
                         for i in range(1, num_partials):
                             tp_price = actual_entry_price + (step_size * i) if is_long else actual_entry_price - (
-                                        step_size * i)
+                                    step_size * i)
                             tp_price_formatted = exchange.price_to_precision(exchange_symbol, tp_price)
 
                             await safe_exchange_call(exchange.create_order, exchange_symbol, 'limit', tp_side,
@@ -722,8 +733,8 @@ async def live_trade_monitor(application: Application):
                         if float(last_partial_size_str) > 0:
                             # Place the final TP with the exact remaining size
                             last_tp_price = actual_entry_price + (
-                                        step_size * num_partials) if is_long else actual_entry_price - (
-                                        step_size * num_partials)
+                                    step_size * num_partials) if is_long else actual_entry_price - (
+                                    step_size * num_partials)
                             last_tp_price_formatted = exchange.price_to_precision(exchange_symbol, last_tp_price)
 
                             await safe_exchange_call(exchange.create_order, exchange_symbol, 'limit', tp_side,
