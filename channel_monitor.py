@@ -52,7 +52,7 @@ with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
     @client.on(events.NewMessage(chats=int(SOURCE_CHANNEL_ID)))
     async def handler(event):
         """
-        This function now validates a signal and then waits 60 seconds
+        This function now validates a signal and then waits 5 seconds
         before acting, checking if the message was deleted during the wait.
         """
         message = event.message
@@ -89,10 +89,10 @@ with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
 
         # --- NEW: DELAY AND DELETION CHECK ---
         message_id = message.id
-        logger.info(f"VALID SIGNAL: #{coin_symbol} detected. Waiting 60 seconds for confirmation...")
+        logger.info(f"VALID SIGNAL: #{coin_symbol} detected. Waiting 5 seconds for confirmation...")
 
-        # Wait for 60 seconds
-        await asyncio.sleep(60)
+        # Wait for 5 seconds
+        await asyncio.sleep(5)
 
         # After waiting, check if the message still exists
         try:

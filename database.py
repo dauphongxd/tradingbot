@@ -105,6 +105,18 @@ SCHEMA = """
             symbol TEXT PRIMARY KEY,
             highest_pnl REAL NOT NULL DEFAULT 0.0
          );
+         
+         CREATE TABLE IF NOT EXISTS pending_orders (
+            order_id TEXT PRIMARY KEY,
+            pair TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            sl_price REAL NOT NULL,
+            is_long INTEGER NOT NULL,
+            risk_setting TEXT NOT NULL,
+            tp_logic TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+         
          """
 
 
@@ -160,6 +172,15 @@ def migrate_database():
             print("Migration successful.")
         else:
             print("'high_water_marks' table already exists. No changes needed.")
+
+        cursor.execute("PRAGMA table_info(pending_orders)")
+        columns = [row['name'] for row in cursor.fetchall()]
+        if 'created_at' not in columns:
+            print("Applying migration: Adding 'created_at' column to 'pending_orders' table...")
+            cursor.execute("ALTER TABLE pending_orders ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP")
+            print("Migration successful.")
+        else:
+            print("'created_at' column already exists in 'pending_orders'. No changes needed.")
 
         conn.commit()
 
@@ -323,4 +344,31 @@ def delete_high_water_mark(symbol: str):
     """Removes a high-water mark record when a trade is closed."""
     with get_db_connection() as conn:
         conn.execute("DELETE FROM high_water_marks WHERE symbol = ?", (symbol,))
+        conn.commit()
+
+def add_pending_order(order_id, pair, entry_price, sl_price, is_long, risk_setting, tp_logic):
+    """Adds a new pending order to the database."""
+    with get_db_connection() as conn:
+        conn.execute(
+            """INSERT INTO pending_orders (order_id, pair, entry_price, sl_price, is_long, risk_setting, tp_logic)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (order_id, pair, entry_price, sl_price, is_long, risk_setting, json.dumps(tp_logic))
+        )
+        conn.commit()
+
+def get_pending_orders():
+    """Retrieves all pending orders from the database."""
+    orders = []
+    with get_db_connection() as conn:
+        rows = conn.execute("SELECT * FROM pending_orders").fetchall()
+        for row in rows:
+            order_data = dict(row)
+            order_data['tp_logic'] = json.loads(order_data['tp_logic'])
+            orders.append(order_data)
+    return orders
+
+def delete_pending_order(order_id: str):
+    """Deletes a pending order once it has been filled or cancelled."""
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM pending_orders WHERE order_id = ?", (order_id,))
         conn.commit()

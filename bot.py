@@ -8,6 +8,8 @@ import os
 from uuid import uuid4
 from dataclasses import dataclass, asdict
 import json
+from datetime import datetime, timedelta
+import requests
 
 import ccxt.async_support as ccxt
 from telegram import Update
@@ -26,6 +28,10 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER_ID = os.getenv('AUTHORIZED_USER_ID')
 INITIAL_BALANCE = 1000.00
 POLL_INTERVAL_SECONDS = 3  # Check prices more frequently
+MARKET_ORDER_TOLERANCE = 0.0025  # 0.25% tolerance for immediate market orders
+PENNY_COIN_MCAP_THRESHOLD = 50000000  # $50 Million market cap
+MAX_CONCURRENT_LONGS = 10
+MAX_CONCURRENT_SHORTS = 10
 
 # --- Define keywords for the smart filter ---
 BUY_WORDS = {'buy', 'long', 'bullish', 'buying', 'bought', 'longed'}
@@ -120,24 +126,25 @@ async def safe_exchange_call(func, *args, **kwargs):
 #  The Async Market Monitor
 # ==============================================================================
 async def market_monitor(application: Application):
-    """The 'control tower' that now checks for SL, manual closures, and partial TPs."""
     logger.info("Market monitor started.")
     while True:
         try:
+            # --- Get BOTH pending orders and open trades ---
+            pending_orders = db.get_pending_orders()
             open_trades = db.get_open_trades()
-            if not open_trades:
+
+            if not open_trades and not pending_orders:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            pairs_to_watch = list(set(trade.pair for trade in open_trades))
+            # Create a combined set of all unique pairs to watch
+            pairs_to_watch = set(trade.pair for trade in open_trades) | set(order['pair'] for order in pending_orders)
+
             if not pairs_to_watch:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            tickers = await safe_exchange_call(exchange.fetch_tickers, pairs_to_watch)
-
-            # if tickers:
-            #     print(f"DEBUG: Ticker keys received from exchange: {list(tickers.keys())}")
+            tickers = await safe_exchange_call(exchange.fetch_tickers, list(pairs_to_watch))
 
             if not tickers:
                 logger.critical("[Monitor] Could not fetch market data from exchange. It may be down. Pausing for 60s.")
@@ -147,6 +154,55 @@ async def market_monitor(application: Application):
                 )
                 await asyncio.sleep(60)
                 continue
+
+            for order in pending_orders:
+                try:
+                    # SQLite stores timestamps as strings; we need to parse them into datetime objects.
+                    # The format matches 'YYYY-MM-DD HH:MM:SS'.
+                    created_at_str = order['created_at']
+                    if not created_at_str:  # Safety check for old orders that might not have a timestamp
+                        continue
+
+                    created_at = datetime.strptime(created_at_str, '%Y-%m-%d %H:%M:%S')
+
+                    # If the order is older than 24 hours, cancel it.
+                    if datetime.now() - created_at > timedelta(hours=24):
+                        logger.warning(
+                            f"Pending order for {order['pair']} (ID: {order['order_id']}) has expired. Canceling.")
+
+                        # Delete from the database
+                        db.delete_pending_order(order['order_id'])
+
+                        # Notify the user
+                        await application.bot.send_message(
+                            chat_id=int(AUTHORIZED_USER_ID),
+                            text=f"⏰ **Order Expired** ⏰\n\nThe pending order for **{order['pair']}** was not filled within 24 hours and has been automatically canceled.",
+                            parse_mode='Markdown'
+                        )
+                        # Skip the rest of the checks for this canceled order
+                        continue
+
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Could not parse timestamp for order {order['order_id']}: {e}")
+                    continue
+
+                standardized_symbol = order['pair'].replace("USDT", "/USDT:USDT")
+                if standardized_symbol not in tickers:
+                    continue
+
+                current_price = float(tickers[standardized_symbol]['last'])
+                entry_price = order['entry_price']
+
+                # Check for fill condition
+                should_fill = False
+                if order['is_long'] and current_price >= entry_price:
+                    should_fill = True
+                elif not order['is_long'] and current_price <= entry_price:
+                    should_fill = True
+
+                if should_fill:
+                    # Use our new function to handle the execution
+                    await execute_filled_order(application, order)
 
             for trade in open_trades:
                 # --- START OF THE DEFINITIVE FIX ---
@@ -540,166 +596,341 @@ async def tplevels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message, parse_mode='Markdown')
 
-async def execute_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, trading_pair: str, photo_file_id: str):
-    """Downloads an image from a file_id, extracts prices, and opens a trade."""
-    try:
-        # 1. Get the image file and analyze it
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays a list of all available commands."""
+    if update.message.from_user.id != int(AUTHORIZED_USER_ID):
+        return
+
+    help_text = (
+        "**Trading Bot Commands**\n\n"
+        "**General:**\n"
+        "`/help` - Shows this help message.\n"
+        "`/balance` - Displays your current account balance.\n\n"
+        "**Trade Management:**\n"
+        "`/positions` - Shows all open positions.\n"
+        "`/tplevels <SYMBOL>` - Shows the TP status for an open trade (e.g., `/tplevels BTC`).\n"
+        "`/close_by_symbol <SYMBOL>` - Manually closes an open trade at market price.\n\n"
+        "**Pending Order Management:**\n"
+        "`/pending` - Lists all pending orders waiting to be filled.\n"
+        "`/cancel <SYMBOL or ID>` - Cancels a pending order (e.g., `/cancel BTC` or `/cancel <order_id>`).\n\n"
+        "**Settings:**\n"
+        "`/setleverage <value>` - Sets the leverage for future trades (e.g., `/setleverage 20`).\n"
+        "`/setrisk <amount>` - Sets risk as a fixed amount (e.g., `/setrisk 50`) or percentage (e.g., `/setrisk 1.5%`)."
+    )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+
+async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays all pending orders that have not yet been filled."""
+    if update.message.from_user.id != int(AUTHORIZED_USER_ID):
+        return
+
+    pending_orders = db.get_pending_orders()
+
+    if not pending_orders:
+        await update.message.reply_text("No pending orders.")
+        return
+
+    message = "**Pending Orders:**\n\n"
+    for order in pending_orders:
+        direction = "LONG" if order['is_long'] else "SHORT"
+        message += f"- **{order['pair']}** ({direction})\n"
+        message += f"  Entry: `{order['entry_price']}`, SL: `{order['sl_price']}`\n"
+        # Display the first few characters of the ID for easy cancellation
+        message += f"  ID: `{order['order_id'][:8]}...`\n\n"
+
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels a pending order by its symbol or ID."""
+    if update.message.from_user.id != int(AUTHORIZED_USER_ID):
+        return
+
+    try:
+        identifier = context.args[0].upper()
+    except IndexError:
+        await update.message.reply_text("Usage: `/cancel <SYMBOL or Order ID>`")
+        return
+
+    pending_orders = db.get_pending_orders()
+    order_to_cancel = None
+
+    # Search for the order by symbol or partial/full ID
+    for order in pending_orders:
+        pair_symbol = order['pair'].replace("USDT", "")
+        if pair_symbol == identifier or order['order_id'].upper().startswith(identifier):
+            order_to_cancel = order
+            break
+
+    if order_to_cancel:
+        db.delete_pending_order(order_to_cancel['order_id'])
+        logger.info(f"Canceled pending order for {order_to_cancel['pair']} by user command.")
+        await update.message.reply_text(
+            f"✅ **Pending order for {order_to_cancel['pair']} has been canceled.**"
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ No pending order found with the symbol or ID: **{identifier}**"
+        )
+
+
+async def create_pending_order(update: Update, context: ContextTypes.DEFAULT_TYPE, trading_pair: str,
+                               photo_file_id: str):
+    """
+    Acts as a router. Analyzes a signal and decides whether to execute a trade
+    immediately (market order) or create a pending limit order based on the
+    coin's market cap and proximity to the entry price.
+    """
+    try:
+        # --- Stage 1: Standard Signal Analysis (same as before) ---
         photo_file = await context.bot.get_file(photo_file_id)
-        image_path = f"{photo_file.file_id}.jpg"
+        image_path = f"temp_{photo_file.file_id}.jpg"
         await photo_file.download_to_drive(image_path)
-        await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                       text=f"Analyzing chart for **{trading_pair}**...", parse_mode='Markdown')
         extracted = extract_prices_from_image(image_path)
         os.remove(image_path)
 
-        # 2. Validate the extracted data
         if not all(k in extracted for k in ['entry', 'stoploss']):
             await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                           text=f"❌ **Analysis Failed:** Missing 'entry' or 'stoploss'. OCR could not read the image clearly. Data: `{extracted}`")
+                                           text=f"❌ **Analysis Failed:** Missing entry/SL for {trading_pair}.")
             return
 
         entry = extracted['entry']
         sl = extracted['stoploss']
-        is_long = sl < entry  # Determine direction based on prices
+        is_long = sl < entry  # Determine the new signal's direction
 
-        # --- THIS IS THE FIX ---
-        tp = None
-        # --- END FIX ---
+        # --- START OF NEW GATEKEEPER LOGIC ---
+        # Check the current number of open positions before proceeding.
+        open_trades = db.get_open_trades()
+        long_count = sum(1 for trade in open_trades if trade.is_long)
+        short_count = sum(1 for trade in open_trades if not trade.is_long)
 
-        if (is_long and entry <= sl) or (not is_long and entry >= sl):
-            await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                           text=f"❌ **Logic Error:** Stop-Loss (`{sl}`) must be below entry (`{entry}`) for a LONG, or above for a SHORT.")
-            return
+        if is_long and long_count >= MAX_CONCURRENT_LONGS:
+            logger.warning(
+                f"Signal for {trading_pair} ignored. Max concurrent LONG positions ({MAX_CONCURRENT_LONGS}) reached.")
+            await context.bot.send_message(
+                chat_id=int(AUTHORIZED_USER_ID),
+                text=f"⚠️ **Signal Ignored: {trading_pair} (LONG)**\n\nThe maximum number of open LONG positions ({MAX_CONCURRENT_LONGS}) has been reached.",
+                parse_mode='Markdown'
+            )
+            return  # Stop processing this signal
 
-        if 'target' in extracted:
-            tp = extracted['target']
-            if (is_long and tp <= entry) or (not is_long and tp >= entry):
-                await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                               text=f"⚠️ **Warning:** Target price (`{tp}`) is on the wrong side of entry. Ignoring target.")
-                tp = None  # Invalidate the target
+        elif not is_long and short_count >= MAX_CONCURRENT_SHORTS:
+            logger.warning(
+                f"Signal for {trading_pair} ignored. Max concurrent SHORT positions ({MAX_CONCURRENT_SHORTS}) reached.")
+            await context.bot.send_message(
+                chat_id=int(AUTHORIZED_USER_ID),
+                text=f"⚠️ **Signal Ignored: {trading_pair} (SHORT)**\n\nThe maximum number of open SHORT positions ({MAX_CONCURRENT_SHORTS}) has been reached.",
+                parse_mode='Markdown'
+            )
+            return  # Stop processing this signal
 
-        if entry == sl:
-            await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                           text="Analysis failed. Entry and Stop-Loss prices cannot be the same.")
-            return
 
-        # 3. Calculate position size and create the trade object
-        leverage = float(db.get_setting('leverage'))
-        balance = float(db.get_setting('balance'))
+        tp = extracted.get('target')
+        pair_tag = trading_pair.replace("USDT", "")
 
-        # --- START OF MODIFICATION ---
-        # Fetch the risk amount dynamically from the database
-        risk_setting = db.get_setting('risk_per_trade')
-        risk_per_trade = 0.0  # This will hold the final calculated dollar amount
+        # --- Stage 2: Check if it's a Penny Coin ---
+        market_cap = get_market_cap(pair_tag)
+        is_penny_trade = market_cap is not None and market_cap < PENNY_COIN_MCAP_THRESHOLD
 
-        if not risk_setting:
-            await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                           text="⚠️ **CRITICAL:** Risk per trade is not set. Please use `/setrisk`.")
-            return
-
-        # Check if the setting is a percentage
-        if '%' in risk_setting:
-            percentage = float(risk_setting.strip('%'))
-            risk_per_trade = (percentage / 100) * balance
-        # Otherwise, it's a fixed amount
+        if is_penny_trade:
+            logger.info(
+                f"{trading_pair} identified as a penny coin (MCap: ${market_cap:,.0f}). Applying penny strategy.")
         else:
-            risk_per_trade = float(risk_setting)
+            logger.info(f"{trading_pair} is not a penny coin (MCap: ${market_cap:,.0f}). Applying standard strategy.")
 
-        if risk_per_trade > balance:
-            await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                           text=f"Insufficient balance. Calculated Risk: ${risk_per_trade:,.2f}, Available: ${balance:,.2f}")
-            return
-            # --- END OF MODIFICATION ---
-
-        stop_loss_distance = abs(entry - sl)
-        if stop_loss_distance == 0:
-            await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                           text="Analysis failed due to zero stop-loss distance.")
-            return
-
-        # Use the dynamic variable here instead of the constant
-        position_size_asset = risk_per_trade / stop_loss_distance
-        position_size_usd = position_size_asset * entry
-        trade_id = str(uuid4())
-
-        # Determine direction from the entry/sl prices, not the caption
-        is_long = sl < entry
-
-        # --- START: NEW TP CALCULATION LOGIC ---
-        calculated_tp_levels = None
-
-        # First, we always need the risk distance (the "R" in RR)
-        stop_loss_distance = abs(entry - sl)
-
-        # Case 1: A target price was successfully extracted from the image
-        if tp and ((is_long and tp > entry) or (not is_long and tp < entry)):
-            total_profit_range = abs(tp - entry)
-            step_size = total_profit_range / 10
-            calculated_tp_levels = [
-                {"price": entry + (step_size * i) if is_long else entry - (step_size * i), "status": "pending"} for
-                i in range(1, 11)]
-            logger.info(f"Using image-based target for {trading_pair}. Final TP: {tp}")
-
-        # Case 2: No target was found, so we calculate TPs based on a 10R target
+        # --- Stage 3: The ROUTING Logic ---
+        # Determine the TP logic based on the coin type
+        if is_penny_trade:
+            # For penny coins, use a 0.2R target
+            tp_logic_data = {'type': 'rr', 'value': 0.2}
         else:
-            if tp:  # This handles the case where the OCR found a target, but it was invalid (on the wrong side of entry)
-                await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                               text=f"⚠️ Warning: Target price (`{tp}`) is invalid. Defaulting to 10R calculation.")
-                tp = None  # Nullify the invalid target
+            # For everything else, use the standard logic
+            tp_logic_data = {'type': 'rr', 'value': 10.0}  # Default to 10R
+            if tp and ((is_long and tp > entry) or (not is_long and tp < entry)):
+                tp_logic_data = {'type': 'target', 'value': tp}
 
-            logger.info(f"No valid target found for {trading_pair}. Calculating 10R-based TPs.")
+        # For penny coins, check if we should do a market order
+        if is_penny_trade:
+            ticker = await safe_exchange_call(exchange.fetch_ticker, trading_pair)
+            if ticker and ticker.get('last'):
+                current_price = float(ticker['last'])
+                price_diff_percent = abs(current_price - entry) / entry
 
-            FINAL_RR = 10.0
-            total_profit_range = stop_loss_distance * FINAL_RR
-            step_size = total_profit_range / 10  # This conveniently simplifies to stop_loss_distance
+                if price_diff_percent <= MARKET_ORDER_TOLERANCE:
+                    # --- ROUTE 1: IMMEDIATE MARKET EXECUTION ---
+                    logger.info(
+                        f"Price is within tolerance ({price_diff_percent:.4%}). Executing market order for {trading_pair}.")
+                    await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
+                                                   text=f"⚡️ **Penny Coin Market Order** ⚡️\n\nPrice for **{trading_pair}** is close to entry. Filling immediately...")
 
-            calculated_tp_levels = [
-                {"price": entry + (step_size * i) if is_long else entry - (step_size * i), "status": "pending"} for
-                i in range(1, 11)]
-        # --- END: NEW TP CALCULATION LOGIC ---
+                    # We create a "dummy" order dictionary and pass it directly to the execution function
+                    dummy_order = {
+                        "order_id": f"market_{str(uuid4())}",
+                        "pair": trading_pair, "entry_price": current_price,  # Use current price for market order
+                        "sl_price": sl, "is_long": is_long,
+                        "risk_setting": db.get_setting('risk_per_trade'),
+                        "tp_logic": tp_logic_data
+                    }
+                    await execute_filled_order(context.application, dummy_order, is_market_order=True)
+                    return  # Stop here, the trade is done
 
-        trade = PaperTrade(
-            trade_id=trade_id, pair=trading_pair, entry_price=entry, sl_price=sl,
-            initial_size=position_size_asset, remaining_size=position_size_asset,
-            leverage=leverage, is_long=is_long, tp_levels=calculated_tp_levels,
-            sl_moved_to_be=False
+        # --- ROUTE 2: PENDING LIMIT ORDER (Default for non-penny coins or penny coins outside the price tolerance) ---
+        logger.info(f"Price is outside tolerance or it's a standard coin. Creating pending order for {trading_pair}.")
+        order_id = str(uuid4())
+        db.add_pending_order(
+            order_id=order_id, pair=trading_pair, entry_price=entry,
+            sl_price=sl, is_long=is_long,
+            risk_setting=db.get_setting('risk_per_trade'),
+            tp_logic=tp_logic_data
         )
-
-        db.add_trade(trade)
-
-        # 4. Send the final confirmation message
         direction = "LONG" if is_long else "SHORT"
-        sl_percent_display = (stop_loss_distance / entry) * 100
-        tp_message = "Not Set"
-        if calculated_tp_levels:
-            final_tp_price = calculated_tp_levels[-1]['price']
-            # The number of decimals can be important for crypto, let's format it properly
-            price_format = f".{8 - len(str(int(final_tp_price)))}f"  # Dynamic precision formatting
-
-            if tp:
-                # If the original 'tp' variable exists, it was an image-based target
-                tp_message = f"**10 Partial TPs** up to `{final_tp_price:{price_format}}` (from image)"
-            else:
-                # Otherwise, it was calculated via RR
-                tp_message = f"**10 Partial TPs** calculated up to `{final_tp_price:{price_format}}` (10R)"
-        # --- END: NEW CONFIRMATION MESSAGE LOGIC ---
-
         await context.bot.send_message(
             chat_id=int(AUTHORIZED_USER_ID),
-            text=f"✅ **Trade Opened for {trading_pair}** ({direction})\n\n"
-                 f"Leverage: **{leverage}x**\nRisk Amount: `${risk_per_trade:,.2f}`\n"  # <-- Use the variable
-                 f"Position Value (USD): `${position_size_usd:,.2f}`\n\n"
-                 f"Entry: `{entry}`\nStop-Loss: `{sl}` ({sl_percent_display:.2f}% move)\n"
-                 f"Take-Profit: {tp_message}\n\n"
-                 f"Current Balance: `${balance:,.2f}`",
+            text=f"⏳ **Pending Order Created: {trading_pair}** ({direction})\n\n"
+                 f"🔹 **Entry:** `{entry}`\n🔹 **Stop-Loss:** `{sl}`\n"
+                 f"The bot will fill this order when the entry price is reached.",
             parse_mode='Markdown'
         )
 
     except Exception as e:
-        logger.error(f"Error in execute_trade: {e}", exc_info=True)
-        await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                       text=f"A critical error occurred while trying to execute the trade: {e}")
+        logger.error(f"Error in create_pending_order: {e}", exc_info=True)
+        await context.bot.send_message(
+            chat_id=int(AUTHORIZED_USER_ID),
+            text=f"A critical error occurred while trying to create the pending order: {e}"
+        )
+
+
+def get_market_cap(symbol: str) -> float | None:
+    """
+    Fetches the market cap for a given crypto symbol from the CoinGecko API.
+    Returns the market cap as a float, or None if not found.
+    """
+    # CoinGecko's API is often slow to list brand new coins.
+    # We use a cache to avoid spamming the API for the same symbols repeatedly.
+    if 'coingecko_cache' not in app_state:
+        app_state['coingecko_cache'] = {}
+
+    if symbol in app_state['coingecko_cache']:
+        return app_state['coingecko_cache'][symbol]
+
+    try:
+        # 1. First, we need to find the coin's 'id' on CoinGecko (e.g., 'bitcoin', 'aster')
+        search_url = f"https://api.coingecko.com/api/v3/search?query={symbol}"
+        response = requests.get(search_url, timeout=5)
+        response.raise_for_status()
+        search_data = response.json()
+
+        if not search_data['coins']:
+            logger.warning(f"[CoinGecko] Could not find a coin ID for symbol '{symbol}'")
+            return None
+
+        # Assume the first result is the correct one
+        coin_id = search_data['coins'][0]['id']
+
+        # 2. Now, get the detailed market data using the id
+        market_url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd&include_market_cap=true"
+        response = requests.get(market_url, timeout=5)
+        response.raise_for_status()
+        market_data = response.json()
+
+        market_cap = market_data.get(coin_id, {}).get('usd_market_cap')
+
+        if market_cap is not None:
+            logger.info(f"[CoinGecko] Fetched market cap for {symbol} ({coin_id}): ${market_cap:,.2f}")
+            app_state['coingecko_cache'][symbol] = market_cap  # Cache the result
+            return float(market_cap)
+        else:
+            return None
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[CoinGecko] API Error fetching market cap for {symbol}: {e}")
+        return None
+    except (KeyError, IndexError):
+        logger.error(f"[CoinGecko] Could not parse API response for {symbol}.")
+        return None
+
+
+async def execute_filled_order(application: Application, pending_order: dict, is_market_order: bool = False):
+    """Takes a pending order that has been triggered (or a dummy market order) and executes the paper trade."""
+    try:
+        logger.info(f"Executing filled order for {pending_order['pair']}")
+
+        # --- Sizing logic (same as before) ---
+        balance = float(db.get_setting('balance'))
+        leverage = float(db.get_setting('leverage'))
+        risk_setting = pending_order['risk_setting']
+        entry = pending_order['entry_price']
+        sl = pending_order['sl_price']
+        is_long = pending_order['is_long']
+        trading_pair = pending_order['pair']
+
+        risk_per_trade = 0.0
+        if '%' in risk_setting:
+            risk_per_trade = (float(risk_setting.strip('%')) / 100) * balance
+        else:
+            risk_per_trade = float(risk_setting)
+
+        stop_loss_distance = abs(entry - sl)
+        position_size_asset = risk_per_trade / stop_loss_distance
+        position_size_usd = position_size_asset * entry
+
+        # --- MODIFIED TP Level Calculation ---
+        tp_logic = pending_order['tp_logic']
+        calculated_tp_levels = []
+
+        # Check if the risk-reward value is less than 1 (our penny coin strategy)
+        if tp_logic['type'] == 'rr' and tp_logic['value'] < 1.0:
+            # --- Penny Coin Logic: Single TP at 0.2R ---
+            rr_value = tp_logic['value']
+            profit_distance = stop_loss_distance * rr_value
+            tp_price = entry + profit_distance if is_long else entry - profit_distance
+            calculated_tp_levels = [{"price": tp_price, "status": "pending"}]
+            logger.info(f"Applying single TP strategy for penny coin. TP set at {tp_price}")
+        else:
+            # --- Standard Logic: 10 Partial TPs ---
+            if tp_logic['type'] == 'target':
+                tp = tp_logic['value']
+                total_profit_range = abs(tp - entry)
+                step_size = total_profit_range / 10
+            else:  # Default to RR
+                FINAL_RR = tp_logic['value']
+                total_profit_range = stop_loss_distance * FINAL_RR
+                step_size = total_profit_range / 10
+            calculated_tp_levels = [
+                {"price": entry + (step_size * i) if is_long else entry - (step_size * i), "status": "pending"} for i in
+                range(1, 11)]
+
+        # --- Create and Save the Trade ---
+        trade = PaperTrade(
+            trade_id=str(uuid4()), pair=trading_pair, entry_price=entry, sl_price=sl,
+            initial_size=position_size_asset, remaining_size=position_size_asset,
+            leverage=leverage, is_long=is_long, tp_levels=calculated_tp_levels
+        )
+        db.add_trade(trade)
+
+        # Only delete from pending if it was a real limit order
+        if not is_market_order:
+            db.delete_pending_order(pending_order['order_id'])
+
+        # --- Send Notification ---
+        direction = "LONG" if is_long else "SHORT"
+        final_tp_price = calculated_tp_levels[-1]['price']
+        order_type_text = "Market Order Filled" if is_market_order else "Pending Order Filled"
+
+        await application.bot.send_message(
+            chat_id=int(AUTHORIZED_USER_ID),
+            text=f"✅ **{order_type_text} & Opened for {trading_pair}** ({direction})\n\n"
+                 f"Position Value: `${position_size_usd:,.2f}`\n"
+                 f"Entry: `{entry:.4f}`\nStop-Loss: `{sl}`\n"
+                 f"Final TP: `{final_tp_price:.4f}`\n\n"
+                 f"New Balance: `${balance:,.2f}`",
+            parse_mode='Markdown'
+        )
+
+    except Exception as e:
+        logger.error(f"CRITICAL: Failed to execute filled order. Error: {e}", exc_info=True)
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -817,7 +1048,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not clean_caption.strip():
         logger.info("Clean signal detected. Executing trade automatically.")
         # Note: execute_trade will re-download and re-process the image, which is perfectly fine.
-        await execute_trade(update, context, trading_pair, photo_file_id)
+        await create_pending_order(update, context, trading_pair, photo_file_id)
     else:
         # ... (The logic for asking for confirmation on complex signals remains the same)
         request_id = str(uuid4())
@@ -862,7 +1093,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "confirm_trade":
             await query.edit_message_text(text=f"✅ Confirmation received. Opening trade for {trading_pair}...")
             # The core action is the same
-            await execute_trade(update, context, trading_pair, photo_file_id)
+            await create_pending_order(update, context, trading_pair, photo_file_id)
 
         elif action == "ignore_trade":
             await query.edit_message_text(text="❌ Signal ignored.")
@@ -898,18 +1129,19 @@ async def main():
         .build()
     )
 
-    # Register command handlers
-    application.add_handler(CommandHandler("start", placeholder_command))
-    application.add_handler(CommandHandler("help", placeholder_command))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("positions", positions_command))
+    application.add_handler(CommandHandler("pending", pending_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("tplevels", tplevels_command))
     application.add_handler(CommandHandler("setleverage", set_leverage_command))
     application.add_handler(CommandHandler("setrisk", set_risk_command))
+    application.add_handler(CommandHandler("close_by_symbol", close_command_handler))
+
+    # Message and button handlers
     application.add_handler(MessageHandler(filters.PHOTO & filters.CAPTION, message_handler))
     application.add_handler(CallbackQueryHandler(button_handler))
-
-    application.add_handler(CommandHandler("close_by_symbol", close_command_handler))
 
     # --- This is the new, non-blocking way to run the bot ---
     try:

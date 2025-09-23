@@ -74,7 +74,7 @@
                             <th>Current P/L</th>
                             <th>Peak P/L</th>
                             <th>Current Price</th>
-                            <th>Actions</th>
+<!--                            <th>Actions</th>-->
                         </tr>
                     </thead>
                     <tbody>
@@ -153,13 +153,13 @@
                             </td>
 
                             <!-- Actions -->
-                            <td>
-                                <a href="{{ url_for('close_trade', trade_id=trade.trade_id) }}"
-                                   class="close-button"
-                                   onclick="return confirm('Are you sure you want to manually close this {{trade.pair}} trade?');">
-                                   &times;
-                                </a>
-                            </td>
+<!--                            <td>-->
+<!--                                <a href="{{ url_for('close_trade', trade_id=trade.trade_id) }}"-->
+<!--                                   class="close-button"-->
+<!--                                   onclick="return confirm('Are you sure you want to manually close this {{trade.pair}} trade?');">-->
+<!--                                   &times;-->
+<!--                                </a>-->
+<!--                            </td>-->
                         </tr>
                         {% endfor %}
                     </tbody>
