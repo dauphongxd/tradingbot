@@ -103,10 +103,7 @@ def dashboard():
     processed_trades = []
     for trade in open_trades_data:
         try:
-            original_pair = trade['pair']
-            formatted_pair = original_pair.replace("USDT", "/USDT")
-
-            ticker = safe_sync_exchange_call(exchange.fetch_ticker, formatted_pair)
+            ticker = safe_sync_exchange_call(exchange.fetch_ticker, trade['pair'])
             if not ticker:
                 raise ccxt.NetworkError("Failed to fetch price after retries.")
             current_price = ticker['last']
