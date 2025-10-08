@@ -8,3 +8,6 @@ trading_bot.db
 trading_bot_testnet.db
 trading_monitor_session.session-journal
 test.py
+.pycache/
+.idea/
+.venv/

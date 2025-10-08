@@ -240,42 +240,14 @@ async def market_monitor(application: Application):
                     await process_trade_closure(application, trade, "SL_HIT", trade.sl_price)
                     continue
 
-                # --- 2. Check for PARTIAL TAKE PROFIT hits ---
+                # --- 2. Check for TAKE PROFIT hit (single 0.5R TP) ---
                 if trade.tp_levels:
                     for i, level in enumerate(trade.tp_levels):
                         if level['status'] == 'pending':
                             if (trade.is_long and current_price >= level['price']) or \
                                     (not trade.is_long and current_price <= level['price']):
-
                                 await process_partial_tp_closure(application, trade, level, i)
-
-                                # --- NEW HYBRID STOP-LOSS LOGIC ---
-                                new_sl_price = None
-                                notification_reason = ""
-
-                                if i == 1 and not trade.sl_moved_to_be:
-                                    new_sl_price = trade.entry_price
-                                    trade.sl_moved_to_be = True
-                                    notification_reason = "TP2 hit. Trade is now risk-free."
-                                elif i > 1:
-                                    new_sl_price = trade.tp_levels[i - 2]['price']
-                                    notification_reason = f"TP{i + 1} hit. Trailing stop-loss updated."
-
-                                if new_sl_price and new_sl_price != trade.sl_price:
-                                    original_sl = trade.sl_price
-                                    trade.sl_price = new_sl_price
-                                    db.update_trade(trade)
-
-                                    message = (
-                                        f"✅ **Stop-Loss Updated for {trade.pair}** ✅\n\n"
-                                        f"{notification_reason}\n\n"
-                                        f"Original SL: `{original_sl}`\n"
-                                        f"**New SL: `{trade.sl_price}`**"
-                                    )
-                                    await application.bot.send_message(
-                                        chat_id=int(AUTHORIZED_USER_ID), text=message, parse_mode='Markdown'
-                                    )
-                                    logger.info(f"Moved SL for trade {trade.trade_id} to {trade.sl_price}. Reason: {notification_reason}")
+                                # No SL trailing logic needed for single TP strategy
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
         except ccxt.NetworkError as e:
@@ -287,12 +259,12 @@ async def market_monitor(application: Application):
 
 
 async def process_partial_tp_closure(application: Application, trade: PaperTrade, level: dict, level_index: int):
-    """Handles the logic for a single partial take-profit hit."""
+    """Handles the logic for take-profit hit (now always closes 100% at 0.5R)."""
 
-    # Close 10% of the ORIGINAL position size
-    size_to_close = trade.initial_size / 10
+    # Close the entire remaining position
+    size_to_close = trade.remaining_size
 
-    # Calculate PNL for this portion
+    # Calculate PNL for the entire position
     exit_price = level['price']
     price_diff = exit_price - trade.entry_price
     if not trade.is_long:
@@ -300,43 +272,32 @@ async def process_partial_tp_closure(application: Application, trade: PaperTrade
 
     pnl = price_diff * size_to_close
 
-
-
     # Update state
     current_balance = float(db.get_setting("balance"))
     new_balance = current_balance + pnl
     db.update_setting("balance", new_balance)
 
-    trade.remaining_size -= size_to_close
-    trade.cumulative_pnl += pnl  # <-- ADD THIS LINE to update the running total
+    trade.remaining_size = 0
+    trade.cumulative_pnl += pnl
     level['status'] = 'hit'
 
-    is_fully_closed = (level_index == 9) or trade.remaining_size < 1e-8
-    if is_fully_closed:
-        # Pass the final cumulative PNL to the history
-        db.close_trade(trade.trade_id, f"TP{level_index + 1}_FULL_CLOSE", level['price'],
-                       trade.cumulative_pnl)  # <-- FIX
-    else:
-        db.update_trade(trade)
+    # Close the trade completely
+    db.close_trade(trade.trade_id, "TP_HIT", level['price'], trade.cumulative_pnl)
 
     # Prepare notification message
-    result_text = f"🎯🎯🎯 PARTIAL TAKE PROFIT {level_index + 1}/10 🎯🎯🎯\n\n"
     message = (
-        f"{result_text}"
+        f"🎯 **TAKE PROFIT HIT (0.5R)** 🎯\n\n"
         f"Trade: **{trade.pair}**\n"
-        f"Closed **10%** of position at `{level['price']}`\n"
-        f"Portion PNL: `${pnl:,.2f}`\n\n"
+        f"Exit Price: `{level['price']}`\n"
+        f"Total PNL: `${pnl:,.2f}`\n\n"
         f"**New Balance: `${new_balance:,.2f}`**\n"
-        f"Remaining Size: `{trade.remaining_size:.4f}`"
+        f"**Position fully closed.**"
     )
-
-    if is_fully_closed:
-        message += "\n\n**Position fully closed.**"
 
     await application.bot.send_message(
         chat_id=AUTHORIZED_USER_ID, text=message, parse_mode='Markdown'
     )
-    logger.info(f"Partial TP {level_index + 1}/10 hit for trade {trade.trade_id}. PNL: {pnl:,.2f}")
+    logger.info(f"Take profit hit for trade {trade.trade_id}. Total PNL: {pnl:,.2f}")
 
 
 async def process_trade_closure(application: Application, trade: PaperTrade, status: str, exit_price: float):
@@ -545,10 +506,10 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "**Open Positions:**\n\n"
     for trade in open_trades:
         direction = "LONG" if trade.is_long else "SHORT"
-        final_tp = trade.tp_levels[-1]['price'] if trade.tp_levels else "N/A"
+        tp = trade.tp_levels[0]['price'] if trade.tp_levels else "N/A"
         message += f"- **{trade.pair}** ({direction})\n"
-        message += f"  Entry: `{trade.entry_price}`, SL: `{trade.sl_price}`, Final TP: `{final_tp}`\n"
-        message += f"  Initial Size: `{trade.initial_size:.4f}`, Remaining: `{trade.remaining_size:.4f}`\n\n"
+        message += f"  Entry: `{trade.entry_price}`, SL: `{trade.sl_price}`, TP (0.5R): `{tp}`\n"
+        message += f"  Position Size: `{trade.remaining_size:.4f}`\n\n"
 
     await update.message.reply_text(message, parse_mode='Markdown')
 
@@ -727,57 +688,9 @@ async def create_pending_order(update: Update, context: ContextTypes.DEFAULT_TYP
             return  # Stop processing this signal
 
 
-        tp = extracted.get('target')
-        pair_tag = trading_pair.replace("USDT", "")
-
-        # --- Stage 2: Check if it's a Penny Coin ---
-        market_cap = get_market_cap(pair_tag)
-        is_penny_trade = market_cap is not None and market_cap < PENNY_COIN_MCAP_THRESHOLD
-
-        if is_penny_trade:
-            logger.info(
-                f"{trading_pair} identified as a penny coin (MCap: ${market_cap:,.0f}). Applying penny strategy.")
-        else:
-            logger.info(f"{trading_pair} is not a penny coin (MCap: ${market_cap:,.0f}). Applying standard strategy.")
-
-        # --- Stage 3: The ROUTING Logic ---
-        # Determine the TP logic based on the coin type
-        if is_penny_trade:
-            # For penny coins, use a 0.2R target
-            tp_logic_data = {'type': 'rr', 'value': 0.2}
-        else:
-            # For everything else, use the standard logic
-            tp_logic_data = {'type': 'rr', 'value': 10.0}  # Default to 10R
-            if tp and ((is_long and tp > entry) or (not is_long and tp < entry)):
-                tp_logic_data = {'type': 'target', 'value': tp}
-
-        # For penny coins, check if we should do a market order
-        if is_penny_trade:
-            ticker = await safe_exchange_call(exchange.fetch_ticker, trading_pair)
-            if ticker and ticker.get('last'):
-                current_price = float(ticker['last'])
-                price_diff_percent = abs(current_price - entry) / entry
-
-                if price_diff_percent <= MARKET_ORDER_TOLERANCE:
-                    # --- ROUTE 1: IMMEDIATE MARKET EXECUTION ---
-                    logger.info(
-                        f"Price is within tolerance ({price_diff_percent:.4%}). Executing market order for {trading_pair}.")
-                    await context.bot.send_message(chat_id=int(AUTHORIZED_USER_ID),
-                                                   text=f"⚡️ **Penny Coin Market Order** ⚡️\n\nPrice for **{trading_pair}** is close to entry. Filling immediately...")
-
-                    # We create a "dummy" order dictionary and pass it directly to the execution function
-                    dummy_order = {
-                        "order_id": f"market_{str(uuid4())}",
-                        "pair": trading_pair, "entry_price": current_price,  # Use current price for market order
-                        "sl_price": sl, "is_long": is_long,
-                        "risk_setting": db.get_setting('risk_per_trade'),
-                        "tp_logic": tp_logic_data
-                    }
-                    await execute_filled_order(context.application, dummy_order, is_market_order=True)
-                    return  # Stop here, the trade is done
-
-        # --- ROUTE 2: PENDING LIMIT ORDER (Default for non-penny coins or penny coins outside the price tolerance) ---
-        logger.info(f"Price is outside tolerance or it's a standard coin. Creating pending order for {trading_pair}.")
+        # --- Fixed 0.5R Strategy for ALL trades ---
+        tp_logic_data = {'type': 'rr', 'value': 0.5}
+        logger.info(f"Creating pending order for {trading_pair} with fixed 0.5R take profit strategy.")
         order_id = str(uuid4())
         db.add_pending_order(
             order_id=order_id, pair=trading_pair, entry_price=entry,
@@ -876,31 +789,13 @@ async def execute_filled_order(application: Application, pending_order: dict, is
         position_size_asset = risk_per_trade / stop_loss_distance
         position_size_usd = position_size_asset * entry
 
-        # --- MODIFIED TP Level Calculation ---
+        # --- Fixed 0.5R Single TP Strategy ---
         tp_logic = pending_order['tp_logic']
-        calculated_tp_levels = []
-
-        # Check if the risk-reward value is less than 1 (our penny coin strategy)
-        if tp_logic['type'] == 'rr' and tp_logic['value'] < 1.0:
-            # --- Penny Coin Logic: Single TP at 0.2R ---
-            rr_value = tp_logic['value']
-            profit_distance = stop_loss_distance * rr_value
-            tp_price = entry + profit_distance if is_long else entry - profit_distance
-            calculated_tp_levels = [{"price": tp_price, "status": "pending"}]
-            logger.info(f"Applying single TP strategy for penny coin. TP set at {tp_price}")
-        else:
-            # --- Standard Logic: 10 Partial TPs ---
-            if tp_logic['type'] == 'target':
-                tp = tp_logic['value']
-                total_profit_range = abs(tp - entry)
-                step_size = total_profit_range / 10
-            else:  # Default to RR
-                FINAL_RR = tp_logic['value']
-                total_profit_range = stop_loss_distance * FINAL_RR
-                step_size = total_profit_range / 10
-            calculated_tp_levels = [
-                {"price": entry + (step_size * i) if is_long else entry - (step_size * i), "status": "pending"} for i in
-                range(1, 11)]
+        rr_value = tp_logic['value']  # This will always be 0.5
+        profit_distance = stop_loss_distance * rr_value
+        tp_price = entry + profit_distance if is_long else entry - profit_distance
+        calculated_tp_levels = [{"price": tp_price, "status": "pending"}]
+        logger.info(f"Applying fixed 0.5R TP strategy. TP set at {tp_price}")
 
         # --- Create and Save the Trade ---
         trade = PaperTrade(
@@ -916,7 +811,7 @@ async def execute_filled_order(application: Application, pending_order: dict, is
 
         # --- Send Notification ---
         direction = "LONG" if is_long else "SHORT"
-        final_tp_price = calculated_tp_levels[-1]['price']
+        tp_price = calculated_tp_levels[0]['price']
         order_type_text = "Market Order Filled" if is_market_order else "Pending Order Filled"
 
         await application.bot.send_message(
@@ -924,7 +819,7 @@ async def execute_filled_order(application: Application, pending_order: dict, is
             text=f"✅ **{order_type_text} & Opened for {trading_pair}** ({direction})\n\n"
                  f"Position Value: `${position_size_usd:,.2f}`\n"
                  f"Entry: `{entry:.4f}`\nStop-Loss: `{sl}`\n"
-                 f"Final TP: `{final_tp_price:.4f}`\n\n"
+                 f"Take Profit (0.5R): `{tp_price:.4f}`\n\n"
                  f"New Balance: `${balance:,.2f}`",
             parse_mode='Markdown'
         )
